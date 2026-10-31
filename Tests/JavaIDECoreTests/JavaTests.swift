@@ -200,4 +200,13 @@ import Testing
         #expect(JShellREPL.prepareForSending("\n    int x = 1;\n    x + 1\n\n") == "int x = 1;\nx + 1\n")
         #expect(JShellREPL.prepareForSending("  \n") == "")
     }
+
+    @Test func parsesAttachAddress() {
+        #expect(JavaDebugLocator.parseAddress("localhost:5005")! == ("localhost", 5005))
+        #expect(JavaDebugLocator.parseAddress("5005")! == ("localhost", 5005))
+        #expect(JavaDebugLocator.parseAddress(":8000")! == ("localhost", 8000))
+        #expect(JavaDebugLocator.parseAddress("10.0.0.2:5005")! == ("10.0.0.2", 5005))
+        #expect(JavaDebugLocator.parseAddress("host:99999") == nil)
+        #expect(JavaDebugLocator.parseAddress("nope") == nil)
+    }
 }

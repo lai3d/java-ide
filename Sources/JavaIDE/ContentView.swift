@@ -568,8 +568,13 @@ struct OutputView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     VStack(alignment: .leading, spacing: 0) {
-                        Text(workspace.output.isEmpty ? "No output yet. Use Run (⌘R), Test (⌘U) or Check (⌘B)." : workspace.output)
+                        Text(workspace.output.isEmpty ? AttributedString("No output yet. Use Run (⌘R), Test (⌘U) or Build (⌘B).")
+                                                      : OutputLinks.attributed(workspace.output))
                             .font(.system(.body, design: .monospaced))
+                            .environment(\.openURL, OpenURLAction { url in
+                                workspace.openOutputLink(url)
+                                return .handled
+                            })
                             .foregroundStyle(workspace.output.isEmpty ? .secondary : .primary)
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)

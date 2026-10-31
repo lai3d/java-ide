@@ -316,6 +316,14 @@ public enum JavaDebugLocator {
             .sorted { $0.lastPathComponent > $1.lastPathComponent }.first
     }
 
+    /// Parses an attach address: `host:port`, `:port` or just `port` (host defaults to localhost).
+    public static func parseAddress(_ text: String) -> (String, Int)? {
+        let parts = text.trimmingCharacters(in: .whitespaces).split(separator: ":", omittingEmptySubsequences: false)
+        if parts.count == 1, let port = Int(parts[0]), port > 0, port < 65536 { return ("localhost", port) }
+        guard parts.count == 2, let port = Int(parts[1]), port > 0, port < 65536 else { return nil }
+        return (parts[0].isEmpty ? "localhost" : String(parts[0]), port)
+    }
+
     public struct DownloadError: Error, LocalizedError {
         public let message: String
         public var errorDescription: String? { message }

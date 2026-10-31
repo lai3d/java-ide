@@ -26,7 +26,8 @@ Sibling project of [golang-ide](https://github.com/lai3d/golang-ide), [python-id
   - **Gradle** (`build.gradle[.kts]`, uses `./gradlew` if present): Run = `gradle run` with the application plugin, else `classes` + `java`; Test = `gradle test [--tests …]`
   - **Plain sources**: compiles every non-test `.java` file with `javac` into a cache folder (your project stays clean) and runs the class
 - Run (⌘R) runs the current class if it has a `main` method, else the first one found; Build (⌘B), Test (⌘U), Stop (⌘.)
-- **Debugger** (Microsoft's java-debug, running inside jdtls): click a line number (or ⌘F8) for a breakpoint, right-click it for a **conditional breakpoint**; **Debug** (⇧⌘D or the ladybug) launches the current class (Maven/Gradle dependencies on the class path) and pauses on breakpoints and uncaught exceptions. Continue ⌃⌘Y, Step Over F8, Into F7, Out ⇧F8, Stop ⌘.; the Debug panel shows the call stack, expandable variables, and a console that evaluates Java expressions in the selected frame (or feeds the program's stdin while it runs). The first Debug asks to download the java-debug plugin (~3 MB, checksum-verified) from Maven Central into `~/Library/Application Support/JavaIDE/java-debug`
+- **Debugger** (Microsoft's java-debug, running inside jdtls): click a line number (or ⌘F8) for a breakpoint, right-click it for a **conditional breakpoint**; **Debug** (⇧⌘D or the ladybug) launches the current class (Maven/Gradle dependencies on the class path) and pauses on breakpoints and uncaught exceptions. Continue ⌃⌘Y, Step Over F8, Into F7, Out ⇧F8, Stop ⌘.; the Debug panel shows the call stack, **watch expressions** (kept across sessions), expandable variables, and a console that evaluates Java expressions in the selected frame (or feeds the program's stdin while it runs). **Hot code replace**: saving a file while debugging rebuilds it and swaps the changed method bodies into the running JVM (or *Debug ▸ Hot Swap Changed Classes*, ⌘F10). **Attach to JVM…** connects to a JVM started with `-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005`; stopping detaches without killing it. The first Debug asks to download the java-debug plugin (~3 MB, checksum-verified) from Maven Central into `~/Library/Application Support/JavaIDE/java-debug`
+- **Clickable output**: compiler errors (javac, Maven `[line,col]`, Gradle) and stack-trace frames in the Output and Debug consoles are links; project frames open the file at that line, JDK/library frames open their (attached or decompiled) source
 - Output panel with a **stdin field** while a program runs, so `Scanner(System.in)` works (plus an EOF button)
 - **JShell panel** (⌃⌘P) with the project's compiled classes on the class path; **Send Selection to JShell** (⌃↩)
 - **JDK picker** in the status bar and *Java ▸ JDK*: lists every JDK registered with macOS (`/usr/libexec/java_home -V`), or browse for one. The chosen JDK is used for running, building and JShell, and is passed to jdtls as the project runtime
@@ -68,8 +69,7 @@ The first time jdtls opens a Maven or Gradle project it imports it (downloading 
 
 ## Roadmap
 
-- Debugger: watch expressions, hot code replace, attach to a running JVM
-- Clickable stack traces and compiler errors in the Output panel
+- Debugger: logpoints, exception breakpoints for caught exceptions, debugging a single JUnit test
 - Test explorer with per-method runs
 - Maven/Gradle dependency tree sidebar
 

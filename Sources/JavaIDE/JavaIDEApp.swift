@@ -128,7 +128,12 @@ struct JavaIDEApp: App {
                 Button("Debug") { Task { await workspace.startDebugging() } }
                     .keyboardShortcut("d", modifiers: [.shift, .command])
                     .disabled(workspace.rootURL == nil || workspace.isDebugging || workspace.isRunning)
+                Button("Attach to JVM…") { Task { await workspace.attachToJVM() } }
+                    .disabled(workspace.rootURL == nil || workspace.isDebugging)
                 Button("Stop Debugging") { workspace.stopDebugging() }
+                    .disabled(!workspace.isDebugging)
+                Button("Hot Swap Changed Classes") { workspace.hotSwapNow() }
+                    .keyboardShortcut(KeyEquivalent(Character(UnicodeScalar(NSF10FunctionKey)!)), modifiers: [.command])
                     .disabled(!workspace.isDebugging)
                 Divider()
                 Button("Continue") { workspace.debugSession?.resume() }

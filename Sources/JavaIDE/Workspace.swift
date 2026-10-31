@@ -101,6 +101,13 @@ final class Workspace {
     /// Breakpoints per normalized path: zero-based line → condition ("" when unconditional).
     private(set) var breakpoints: [String: [Int: String]] = [:]
     private(set) var debugSession: DebugSession?
+    /// Debugger watch expressions, kept across sessions.
+    private(set) var watchExpressions: [String] = UserDefaults.standard.stringArray(forKey: "watchExpressions") ?? [] {
+        didSet {
+            UserDefaults.standard.set(watchExpressions, forKey: "watchExpressions")
+            debugSession?.watchExpressions = watchExpressions
+        }
+    }
     private(set) var executionLocation: ExecutionLocation?
 
     private(set) var replOutput = ""
@@ -510,6 +517,7 @@ final class Workspace {
             if lspReady, Self.isJava(document.url) || Self.isBuildFile(document.url) {
                 try? lsp?.notify("textDocument/didSave", params: ["textDocument": ["uri": .string(document.uri)]])
             }
+            if Self.isJava(document.url), isDebugging { scheduleHotCodeReplace() }
             if Self.isBuildFile(document.url) {
                 try? lsp?.notify("workspace/didChangeWatchedFiles", params: [
                     "changes": [["uri": .string(document.url.absoluteString), "type": 2]],
@@ -1115,6 +1123,58 @@ final class Workspace {
         }
     }
 
+    /// Opens a location clicked in the Output / Debug console (`javaide://open?...`).
+    func openOutputLink(_ url: URL) {
+        guard let target = OutputLinks.target(from: url) else { return }
+        Task { await open(target) }
+    }
+
+    private func open(_ target: OutputLinks.Target) async {
+        switch target {
+        case .file(let path, let line, let column):
+            let url = URL(fileURLWithPath: path)
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                flashStatus("\(url.lastPathComponent) not found")
+                return
+            }
+            jump(to: url, position: TextPosition(line: max(line - 1, 0), character: max((column ?? 1) - 1, 0)))
+        case .stackFrame(let className, let fileName, let line, let text):
+            let position = TextPosition(line: max(line - 1, 0), character: 0)
+            if let file = projectFile(className: className, fileName: fileName) {
+                jump(to: file, position: position)
+                return
+            }
+            // JDK / library frame: ask jdtls where the class lives (attached source or decompiled).
+            if let lsp, lspReady,
+               let result = try? await lsp.request("workspace/executeCommand", params: [
+                   "command": "java.project.resolveStackTraceLocation",
+                   "arguments": [.string(text.hasPrefix("at ") ? text : "at " + text)],
+               ]),
+               let uri = result.stringValue, !uri.isEmpty,
+               let url = await resolveLocationURL(uri) {
+                jump(to: url, position: position)
+                return
+            }
+            flashStatus("Source for \(className) not found")
+        }
+    }
+
+    /// The project file for a stack frame: matched by package path, else by file name alone.
+    private func projectFile(className: String, fileName: String) -> URL? {
+        let files = Self.allJavaFiles(in: fileTree)
+        let relative = "/" + OutputLinks.relativePath(className: className, fileName: fileName)
+        return files.first { $0.path.hasSuffix(relative) } ?? files.first { $0.lastPathComponent == fileName }
+    }
+
+    /// Navigates with a Back entry, like Go to Definition.
+    private func jump(to url: URL, position: TextPosition) {
+        if let current = currentFile {
+            backStack.append(NavigationPoint(url: current, position: LineIndex(text).position(of: caretOffset)))
+            if backStack.count > 100 { backStack.removeFirst() }
+        }
+        navigate(to: url, position: position)
+    }
+
     /// Sends a line to the running program's stdin (for `Scanner` / `readLine`), echoing it in the output.
     func sendInput(_ line: String) {
         guard let runInput else { return }
@@ -1216,22 +1276,7 @@ final class Workspace {
     /// Debugs the current class (or the project's first main class) under java-debug.
     func startDebugging() async {
         guard let rootURL, !isDebugging, !isRunning else { return }
-        guard let jdk else {
-            flashStatus("No JDK found — choose one in the status bar")
-            return
-        }
-        saveAllNow()
-        if JavaDebugLocator.installedJar == nil {
-            guard await installJavaDebug() else { return }
-        }
-        if !lspHasDebugBundle || lsp == nil {
-            lspStatus = "jdtls: restarting with the debugger…"
-            await restartLanguageServer()
-        }
-        guard let lsp, await waitForServiceReady() else {
-            flashStatus("jdtls is not ready — try again when the status bar says ready")
-            return
-        }
+        guard let (lsp, jdk) = await prepareDebugger() else { return }
         bottomTab = .debug
         do {
             // 1. Which main class, in which jdtls project.
@@ -1270,6 +1315,111 @@ final class Workspace {
         }
     }
 
+    /// Saves, makes sure java-debug is installed and loaded into jdtls, and waits for jdtls to be ready.
+    private func prepareDebugger() async -> (LSPClient, JDK)? {
+        guard let jdk else {
+            flashStatus("No JDK found — choose one in the status bar")
+            return nil
+        }
+        saveAllNow()
+        if JavaDebugLocator.installedJar == nil {
+            guard await installJavaDebug() else { return nil }
+        }
+        if !lspHasDebugBundle || lsp == nil {
+            lspStatus = "jdtls: restarting with the debugger…"
+            await restartLanguageServer()
+        }
+        guard let lsp, await waitForServiceReady() else {
+            flashStatus("jdtls is not ready — try again when the status bar says ready")
+            return nil
+        }
+        return (lsp, jdk)
+    }
+
+    /// Debug ▸ Attach to JVM…: connects to a JVM started with
+    /// `-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005`.
+    func attachToJVM() async {
+        guard let rootURL, !isDebugging else { return }
+        let alert = NSAlert()
+        alert.messageText = "Attach to JVM"
+        alert.informativeText = "Start the JVM with:\n-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005"
+        let field = NSTextField(string: UserDefaults.standard.string(forKey: "attachAddress") ?? "localhost:5005")
+        field.frame = NSRect(x: 0, y: 0, width: 280, height: 24)
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Attach")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let address = field.stringValue.trimmingCharacters(in: .whitespaces)
+        guard let (host, port) = JavaDebugLocator.parseAddress(address) else {
+            flashStatus("Use host:port, e.g. localhost:5005")
+            return
+        }
+        UserDefaults.standard.set(address, forKey: "attachAddress")
+        await attach(host: host, port: port, root: rootURL)
+    }
+
+    func attach(host: String, port: Int, root: URL) async {
+        guard let (lsp, jdk) = await prepareDebugger() else { return }
+        bottomTab = .debug
+        do {
+            // A project name lets java-debug map classes back to this project's sources.
+            let mains = try? await lsp.request("workspace/executeCommand", params: [
+                "command": "vscode.java.resolveMainClass", "arguments": [.string(root.absoluteString)],
+            ]).arrayValue
+            let projectName = mains?.first?["projectName"]?.stringValue
+            let adapterPort = try await lsp.request("workspace/executeCommand", params: ["command": "vscode.java.startDebugSession"])
+            guard let adapterPort = adapterPort.intValue else {
+                flashStatus("java-debug did not start (is the bundle loaded?)")
+                return
+            }
+            var arguments: [String: JSONValue] = [
+                "type": "java", "request": "attach", "name": .string("\(host):\(port)"),
+                "hostName": .string(host), "port": .int(port), "timeout": 15000,
+            ]
+            if let projectName { arguments["projectName"] = .string(projectName) }
+            startSession(port: adapterPort, launch: .object(arguments), programName: "\(host):\(port)", jdk: jdk)
+        } catch {
+            flashStatus("Attach failed: \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: Watches
+
+    func addWatch(_ expression: String) {
+        let trimmed = expression.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty, !watchExpressions.contains(trimmed) else { return }
+        watchExpressions.append(trimmed)
+    }
+
+    func removeWatch(_ expression: String) {
+        watchExpressions.removeAll { $0 == expression }
+    }
+
+    // MARK: Hot code replace
+
+    @ObservationIgnored private var hotCodeReplaceTask: Task<Void, Never>?
+
+    /// Debug ▸ Hot Swap: saves, rebuilds and redefines changed classes now.
+    func hotSwapNow() {
+        guard isDebugging else { return }
+        saveAllNow()
+        scheduleHotCodeReplace()
+    }
+
+    /// After saving during a debug session: let jdtls rebuild, then redefine the changed classes.
+    private func scheduleHotCodeReplace() {
+        hotCodeReplaceTask?.cancel()
+        hotCodeReplaceTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(300))  // batch Save All
+            guard let self, !Task.isCancelled, let lsp = self.lsp, let session = self.debugSession, session.isActive else { return }
+            // false = incremental build; returns once the build has finished.
+            _ = try? await lsp.request("java/buildWorkspace", params: false)
+            guard !Task.isCancelled, session.isActive else { return }
+            await session.hotCodeReplace()
+        }
+    }
+
     private func startSession(port: Int, launch: JSONValue, programName: String, jdk: JDK) {
         let session = DebugSession(breakpoints: breakpoints.mapValues(Self.sourceBreakpoints), programName: programName)
         session.onLocation = { [weak self, weak session] location in
@@ -1287,6 +1437,7 @@ final class Workspace {
             guard let self, self.debugSession === session else { return }
             self.executionLocation = nil
         }
+        session.watchExpressions = watchExpressions
         debugSession = session
         bottomTab = .debug
         session.start(port: port, launchArguments: launch, environment: ToolLocator.environment(jdk: jdk))

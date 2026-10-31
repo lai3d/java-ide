@@ -18,6 +18,13 @@ final class DebugSession {
     /// Bumped on every stop so variable trees (whose references are only valid per stop) rebuild.
     private(set) var stopCount = 0
     private(set) var console = ""
+    /// Watch expressions evaluated in the selected frame on every stop (name = expression).
+    private(set) var watches: [VariableInfo] = []
+    @ObservationIgnored var watchExpressions: [String] = [] {
+        didSet { Task { await refreshWatches() } }
+    }
+    /// "launch" or "attach".
+    @ObservationIgnored private(set) var request = "launch"
 
     @ObservationIgnored private let client = DAPClient()
     @ObservationIgnored private var threadID: Int?
@@ -44,6 +51,7 @@ final class DebugSession {
 
     /// Connects to java-debug on `port` (from jdtls' `vscode.java.startDebugSession`) and launches the program.
     func start(port: Int, launchArguments: JSONValue, environment: [String: String]) {
+        request = launchArguments["request"]?.stringValue ?? "launch"
         client.onEvent = { [weak self] event, body in
             Task { @MainActor in self?.handle(event: event, body: body) }
         }
@@ -78,7 +86,7 @@ final class DebugSession {
                     "supportsRunInTerminalRequest": true, "supportsVariableType": true,
                 ])
                 // integratedTerminal: java-debug asks us (runInTerminal) to start the JVM, giving us its stdin.
-                _ = try await client.request("launch", arguments: launchArguments)
+                _ = try await client.request(request, arguments: launchArguments)
                 if state == .starting { state = .running }
             } catch {
                 log("Launch failed: \(error.localizedDescription)\n")
@@ -89,8 +97,9 @@ final class DebugSession {
 
     func stop() {
         guard state != .ended else { return }
+        let terminate = request == "launch"  // never kill a JVM we only attached to
         Task {
-            _ = try? await client.request("disconnect", arguments: ["terminateDebuggee": true])
+            _ = try? await client.request("disconnect", arguments: ["terminateDebuggee": .bool(terminate)])
             try? await Task.sleep(for: .milliseconds(300))
             client.terminate()
         }
@@ -175,6 +184,7 @@ final class DebugSession {
             guard selectedFrameID == frame.id else { return }
             scopes = body.map(VariableInfo.parseAll) ?? []
             stopCount += 1
+            await refreshWatches()
         }
     }
 
@@ -199,6 +209,53 @@ final class DebugSession {
             } catch {
                 log("\(error.localizedDescription)\n")
             }
+        }
+    }
+
+    // MARK: Watches
+
+    /// Re-evaluates every watch in the selected frame (values only make sense while paused).
+    func refreshWatches() async {
+        let expressions = watchExpressions
+        guard state == .stopped, let frameID = selectedFrameID else {
+            watches = expressions.map { VariableInfo(name: $0, value: "", type: nil, reference: 0) }
+            return
+        }
+        var results: [VariableInfo] = []
+        for expression in expressions {
+            do {
+                let body = try await client.request("evaluate", arguments: [
+                    "expression": .string(expression), "frameId": .int(frameID), "context": "watch",
+                ])
+                results.append(VariableInfo(name: expression, value: body["result"]?.stringValue ?? "",
+                                            type: body["type"]?.stringValue,
+                                            reference: body["variablesReference"]?.intValue ?? 0))
+            } catch {
+                let message = error.localizedDescription.replacingOccurrences(of: "evaluate failed: ", with: "")
+                results.append(VariableInfo(name: expression, value: "⚠︎ \(message)", type: nil, reference: 0))
+            }
+        }
+        guard selectedFrameID == frameID else { return }
+        watches = results
+    }
+
+    // MARK: Hot code replace
+
+    /// Pushes recompiled classes into the running JVM (call after jdtls has rebuilt the saved files).
+    func hotCodeReplace() async {
+        guard state == .running || state == .stopped else { return }
+        do {
+            let body = try await client.request("redefineClasses")
+            let classes = body["changedClasses"]?.arrayValue?.compactMap(\.stringValue) ?? []
+            if !classes.isEmpty {
+                log("\n[hot code replace: \(classes.joined(separator: ", "))]\n")
+                if state == .stopped, let frame = frames.first(where: { $0.id == selectedFrameID }) ?? frames.first {
+                    // The frame may have been popped and re-entered; refresh what we show.
+                    select(frame: frame)
+                }
+            }
+        } catch {
+            log("\n[hot code replace failed: \(error.localizedDescription)]\n")
         }
     }
 
@@ -228,6 +285,12 @@ final class DebugSession {
             log(text)
         case "thread":
             break
+        case "hotcodereplace":
+            // java-debug progress/warnings, e.g. "Hot code replace is not supported for this change".
+            if let message = body["message"]?.stringValue, !message.isEmpty,
+               body["changeType"]?.stringValue == "ERROR" || body["changeType"]?.stringValue == "WARNING" {
+                log("\n[hot code replace: \(message)]\n")
+            }
         case "terminated", "exited":
             if event == "exited", debuggee == nil, let code = body["exitCode"]?.intValue {
                 log("\n[process exited with status \(code)]\n")

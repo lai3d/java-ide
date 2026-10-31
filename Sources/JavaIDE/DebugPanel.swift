@@ -102,10 +102,32 @@ struct CallStackList: View {
 }
 
 struct VariablesTree: View {
+    @Environment(Workspace.self) private var workspace
     let session: DebugSession
+    @State private var newWatch = ""
 
     var body: some View {
         List {
+            Section {
+                ForEach(session.watches) { watch in
+                    HStack(spacing: 4) {
+                        VariableNode(variable: watch, session: session)
+                        Button { workspace.removeWatch(watch.name) } label: { Image(systemName: "xmark.circle.fill") }
+                            .buttonStyle(.borderless)
+                            .foregroundStyle(.tertiary)
+                            .help("Remove watch")
+                    }
+                }
+                TextField("Add watch expression…", text: $newWatch)
+                    .textFieldStyle(.plain)
+                    .font(.system(.callout, design: .monospaced))
+                    .onSubmit {
+                        workspace.addWatch(newWatch)
+                        newWatch = ""
+                    }
+            } header: {
+                Text("Watches")
+            }
             if session.scopes.isEmpty {
                 Text(session.isStopped ? "No variables" : "Variables appear when paused")
                     .foregroundStyle(.secondary)
@@ -171,6 +193,7 @@ struct VariableNode: View {
 }
 
 struct DebugConsole: View {
+    @Environment(Workspace.self) private var workspace
     let session: DebugSession
     @State private var input = ""
 
@@ -179,8 +202,13 @@ struct DebugConsole: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     VStack(alignment: .leading, spacing: 0) {
-                        Text(session.console.isEmpty ? "Program output and evaluation results appear here." : session.console)
+                        Text(session.console.isEmpty ? AttributedString("Program output and evaluation results appear here.")
+                                                     : OutputLinks.attributed(session.console))
                             .font(.system(.callout, design: .monospaced))
+                            .environment(\.openURL, OpenURLAction { url in
+                                workspace.openOutputLink(url)
+                                return .handled
+                            })
                             .foregroundStyle(session.console.isEmpty ? .secondary : .primary)
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
