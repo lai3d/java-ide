@@ -29,7 +29,7 @@ Sibling project of [golang-ide](https://github.com/lai3d/golang-ide), [python-id
 - **Several programs at once**, each in its own Output tab (green dot while running); Run on a target that is already running restarts it
 - **Multi-module projects**: Maven `<modules>` and Gradle `include`s are discovered; running a class in a Maven submodule first installs it with its sibling dependencies (`-pl <module> -am install`), Gradle runs `:<module>:<task>`
 - **Spring Boot**: `@SpringBootApplication` classes are detected (leaf icon) and run the Spring way — `spring-boot:run` for Maven, `bootRun` for Gradle. **Edit Run Configuration…** sets active profiles (`SPRING_PROFILES_ACTIVE`), program arguments, VM options and environment variables per target; Debug uses them too. **Run All Spring Boot Apps** (⇧⌘R) builds a multi-module project once, then starts every application side by side — e.g. the services and gateway of a **Spring Cloud** project
-- Syntax highlighting for `application.properties` and `application.yml` (keys, values, `${placeholders}`, comments)
+- **`application.properties` / `application.yml`**: syntax highlighting, **key completion** (YAML-aware: under `server:` it offers `port`, `ssl`, …; groups open an indented block), **value completion** (booleans, `logging.level` values and other metadata hints) and **hover docs** (type, description, default). Keys come from the `spring-configuration-metadata.json` of every jar on the module's class path (resolved by jdtls), so starters like Spring Cloud Gateway — and your own `@ConfigurationProperties` once built — are included; deprecated keys sort last. *Code ▸ Show Completions* (⌥Esc) opens the list on demand
 - **Debugger** (Microsoft's java-debug, running inside jdtls): click a line number (or ⌘F8) for a breakpoint, right-click it for a **conditional breakpoint**; **Debug** (⇧⌘D or the ladybug) launches the current class (Maven/Gradle dependencies on the class path) and pauses on breakpoints and uncaught exceptions. Continue ⌃⌘Y, Step Over F8, Into F7, Out ⇧F8, Stop ⌘.; the Debug panel shows the call stack, **watch expressions** (kept across sessions), expandable variables, and a console that evaluates Java expressions in the selected frame (or feeds the program's stdin while it runs). **Hot code replace**: saving a file while debugging rebuilds it and swaps the changed method bodies into the running JVM (or *Debug ▸ Hot Swap Changed Classes*, ⌘F10). **Attach to JVM…** connects to a JVM started with `-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005`; stopping detaches without killing it. The first Debug asks to download the java-debug plugin (~3 MB, checksum-verified) from Maven Central into `~/Library/Application Support/JavaIDE/java-debug`
 - **Clickable output**: compiler errors (javac, Maven `[line,col]`, Gradle) and stack-trace frames in the Output and Debug consoles are links; project frames open the file at that line, JDK/library frames open their (attached or decompiled) source
 - Output panel with a **stdin field** while a program runs, so `Scanner(System.in)` works (plus an EOF button)
@@ -45,7 +45,7 @@ Sibling project of [golang-ide](https://github.com/lai3d/golang-ide), [python-id
 - jdtls: `brew install jdtls` (it brings its own JDK 21+ to run on)
 - Optional: `maven` / `gradle` (`brew install maven gradle`) if your projects don't ship `mvnw` / `gradlew`
 
-For scripted testing, `JAVAIDE_BREAKPOINTS="Main.java:9"` sets breakpoints (path relative to the folder, 1-based line) when a folder is opened from the command line.
+`JavaIDE <folder> [file…]` opens a folder and then the given files. For scripted testing, `JAVAIDE_BREAKPOINTS="Main.java:9"` sets breakpoints (path relative to the folder, 1-based line) when a folder is opened from the command line.
 
 JavaIDE looks for tools on `PATH`, `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin` and SDKMAN's folders, so it works when launched from Finder too. jdtls keeps its per-project index in `~/Library/Caches/JavaIDE/` (*Java ▸ Clean Language Server Workspace* resets it).
 
@@ -81,7 +81,7 @@ The first time jdtls opens a Maven or Gradle project it imports it (downloading 
 - Debugger: logpoints, exception breakpoints for caught exceptions, debugging a single JUnit test
 - Test explorer with per-method runs
 - Maven/Gradle dependency tree sidebar
-- Spring Boot: completion for `application.properties` / `.yml` keys (Spring Boot language server), beans and endpoints views
+- Spring Boot: enum values in config completion, unknown-key warnings, beans and endpoints views
 
 ## License
 

@@ -32,6 +32,8 @@ struct CodeEditorView: NSViewRepresentable {
     var highlightCode: Bool
     /// Syntax colouring (Java, or `.properties` / `.yml` config files).
     var language: SyntaxLanguage = .none
+    /// Spring Boot config file (application.properties / .yml): key and value completion and hover.
+    var configCompletion = false
     var isEditable: Bool
     var diagnostics: [Diagnostic]
     var breakpointLines: Set<Int> = []
@@ -41,6 +43,8 @@ struct CodeEditorView: NSViewRepresentable {
     var reveal: RevealTarget?
     /// Changes when the user asks for quick fixes at the caret (⌥↩).
     var quickFixRequest: UUID?
+    /// Bumped by Code ▸ Show Completions.
+    var completionRequest: UUID?
     var services: EditorServices
     var onChange: (String) -> Void
 
@@ -144,6 +148,10 @@ struct CodeEditorView: NSViewRepresentable {
         coordinator.ruler?.setDebugState(breakpoints: breakpointLines, conditional: conditionalBreakpointLines,
                                          executionLine: executionLine)
 
+        if let completionRequest, completionRequest != coordinator.lastCompletionRequest {
+            coordinator.lastCompletionRequest = completionRequest
+            coordinator.showCompletionsNow()
+        }
         if let quickFixRequest, quickFixRequest != coordinator.lastQuickFixRequest {
             coordinator.lastQuickFixRequest = quickFixRequest
             coordinator.showQuickFixes()
@@ -184,6 +192,7 @@ struct CodeEditorView: NSViewRepresentable {
         var appliedExecutionLine: Int?
         var lastRevealID: UUID?
         var lastQuickFixRequest: UUID?
+        var lastCompletionRequest: UUID?
         weak var ruler: LineNumberRuler?
         var documentID = ""
 
@@ -314,7 +323,12 @@ struct CodeEditorView: NSViewRepresentable {
 
             let typed = lastReplacement
             lastReplacement = nil
-            guard parent.highlightCode, !isApplyingCompletion else { return }
+            guard !isApplyingCompletion else { return }
+            if parent.configCompletion {
+                configTextDidChange(typed: typed)
+                return
+            }
+            guard parent.highlightCode else { return }
 
             // Signature help: open on "(" / ",", keep it current while visible.
             if typed == "(" || typed == "," {
@@ -339,6 +353,43 @@ struct CodeEditorView: NSViewRepresentable {
             } else {
                 hideCompletions()
             }
+        }
+
+        /// Completion while typing in application.properties / .yml: keys as you type them, values after
+        /// `=` or `: `.
+        private func configTextDidChange(typed: String?) {
+            guard let textView else { return }
+            let ns = textView.string as NSString
+            let caret = textView.selectedRange().location
+            if let typed, typed.utf16.count == 1, let unit = typed.utf16.first {
+                let previous = caret >= 2 ? ns.character(at: caret - 2) : 0
+                if unit == 0x3D || (unit == 0x20 && previous == 0x3A) {  // "=" or ": "
+                    completionItems = []
+                    completionPopup.hide()
+                    scheduleCompletion(after: .zero)
+                } else if SpringConfigEditing.isKeyCharacter(unit) {
+                    refilterCompletions()
+                    scheduleCompletion(after: .milliseconds(80))
+                } else {
+                    hideCompletions()
+                }
+            } else if typed == "", completionPopup.isVisible {
+                refilterCompletions()
+                scheduleCompletion(after: .milliseconds(80))
+            } else {
+                hideCompletions()
+            }
+        }
+
+        func showCompletionsNow() {
+            guard let textView, textView.isEditable, parent.highlightCode || parent.configCompletion else { return }
+            scheduleCompletion(after: .zero)
+        }
+
+        /// Start of the text a completion replaces: an identifier in Java, a dotted key / value in config files.
+        private func completionPrefixStart(in text: NSString, before caret: Int) -> Int {
+            parent.configCompletion ? SpringConfigEditing.prefixStart(in: text, before: caret)
+                                    : Identifier.prefixStart(in: text, before: caret)
         }
 
         func textViewDidChangeSelection(_ notification: Notification) {
@@ -388,7 +439,7 @@ struct CodeEditorView: NSViewRepresentable {
                 return true
             case #selector(NSResponder.cancelOperation(_:)), #selector(NSTextView.complete(_:)):
                 // Esc / ⌥Esc: show completions on demand.
-                if parent.highlightCode && textView.isEditable { scheduleCompletion(after: .zero) }
+                if (parent.highlightCode || parent.configCompletion) && textView.isEditable { scheduleCompletion(after: .zero) }
                 return true
             case #selector(NSResponder.insertNewline(_:)):
                 autoIndentNewline(in: textView)
@@ -422,7 +473,12 @@ struct CodeEditorView: NSViewRepresentable {
             let afterStart = NSMaxRange(selection)
             let after = afterStart < lineEnd ? ns.substring(with: NSRange(location: afterStart, length: lineEnd - afterStart)) : ""
             guard parent.highlightCode else {
-                let indent = String(before.prefix { $0 == " " || $0 == "\t" })
+                var indent = String(before.prefix { $0 == " " || $0 == "\t" })
+                // YAML: a line ending in "key:" opens a nested block.
+                if parent.language == .yaml, before.trimmingCharacters(in: .whitespaces).hasSuffix(":"),
+                   !before.trimmingCharacters(in: .whitespaces).hasPrefix("#") {
+                    indent += "  "
+                }
                 textView.insertText("\n" + indent, replacementRange: selection)
                 return
             }
@@ -555,9 +611,9 @@ struct CodeEditorView: NSViewRepresentable {
             }
             let ns = textView.string as NSString
             let caret = textView.selectedRange().location
-            let start = Identifier.prefixStart(in: ns, before: caret)
+            let start = completionPrefixStart(in: ns, before: caret)
             let prefix = ns.substring(with: NSRange(location: start, length: caret - start))
-            if let first = prefix.utf16.first, !Identifier.isIdentifierStart(first) {
+            if !parent.configCompletion, let first = prefix.utf16.first, !Identifier.isIdentifierStart(first) {
                 completionPopup.hide()  // typing a number
                 return
             }
@@ -585,7 +641,7 @@ struct CodeEditorView: NSViewRepresentable {
             defer { isApplyingCompletion = false }
 
             let caret = textView.selectedRange().location
-            let start = Identifier.prefixStart(in: textView.string as NSString, before: caret)
+            let start = completionPrefixStart(in: textView.string as NSString, before: caret)
             textView.undoManager?.beginUndoGrouping()
             textView.insertText(item.insertText, replacementRange: NSRange(location: start, length: caret - start))
             var newCaret = start + item.insertText.utf16.count
@@ -608,8 +664,10 @@ struct CodeEditorView: NSViewRepresentable {
         // MARK: Hover
 
         func mouseMoved(to index: Int?) {
-            guard parent.highlightCode, let textView, !completionPopup.isVisible else { return }
-            guard let index, let word = Identifier.wordRange(in: textView.string as NSString, at: index) else {
+            guard parent.highlightCode || parent.configCompletion, let textView, !completionPopup.isVisible else { return }
+            let ns = textView.string as NSString
+            guard let index, let word = parent.configCompletion ? SpringConfigEditing.wordRange(in: ns, at: index)
+                                                                : Identifier.wordRange(in: ns, at: index) else {
                 endHover()
                 return
             }

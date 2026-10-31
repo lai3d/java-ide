@@ -287,6 +287,7 @@ struct EditorArea: View {
                         text: workspace.text,
                         highlightCode: workspace.isJavaFile,
                         language: workspace.currentFile.map(SyntaxLanguage.forFile) ?? .none,
+                        configCompletion: workspace.springConfigKind != nil,
                         isEditable: !workspace.isReadOnly,
                         diagnostics: workspace.currentDiagnostics,
                         breakpointLines: workspace.currentBreakpoints,
@@ -294,6 +295,7 @@ struct EditorArea: View {
                         executionLine: workspace.currentExecutionLine,
                         reveal: workspace.revealTarget,
                         quickFixRequest: workspace.quickFixRequest,
+                        completionRequest: workspace.completionRequest,
                         services: EditorServices(
                             completions: { await workspace.completions(at: $0) },
                             hover: { await workspace.hover(at: $0) },

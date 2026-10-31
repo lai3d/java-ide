@@ -104,6 +104,8 @@ final class Workspace {
     var revealTarget: RevealTarget?
     /// Set by the Code ▸ Show Quick Fixes command; the editor shows the menu at the caret.
     var quickFixRequest: UUID?
+    /// Set to ask the editor to show completions at the caret.
+    var completionRequest: UUID?
     private(set) var backStack: [NavigationPoint] = []
     private(set) var references: [ReferenceItem] = []
     private(set) var referencesQuery = ""
@@ -135,6 +137,10 @@ final class Workspace {
     /// Whether the running jdtls was started with the java-debug bundle.
     @ObservationIgnored private var lspHasDebugBundle = false
     @ObservationIgnored private var targetScanTask: Task<Void, Never>?
+    /// Spring Boot configuration metadata per module (keyed by module folder), for application.properties / .yml.
+    @ObservationIgnored private var springConfigIndexes: [String: (index: SpringConfigIndex, loaded: ContinuousClock.Instant)] = [:]
+    @ObservationIgnored private var springConfigLoads: [String: Task<SpringConfigIndex?, Never>] = [:]
+    @ObservationIgnored private let springMetadataCache = MetadataCache()
     @ObservationIgnored private var handledLaunchArguments = false
 
     var currentDiagnostics: [Diagnostic] {
@@ -195,15 +201,23 @@ final class Workspace {
     func handleLaunchArguments() async {
         guard !handledLaunchArguments else { return }
         handledLaunchArguments = true
+        // `JavaIDE <folder> [file…]`: opens the folder, then any files given after it.
+        var files: [URL] = []
+        var folder: URL?
         for arg in CommandLine.arguments.dropFirst() {
             var isDir: ObjCBool = false
             let url = URL(fileURLWithPath: arg).standardizedFileURL
-            if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
-                await openFolder(url)
-                applyLaunchBreakpoints(root: url)
-                return
+            guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) else { continue }
+            if isDir.boolValue {
+                if folder == nil { folder = url }
+            } else {
+                files.append(url)
             }
         }
+        guard let folder else { return }
+        await openFolder(folder)
+        applyLaunchBreakpoints(root: folder)
+        for file in files { openFile(file) }
     }
 
     /// Dev aid for scripted testing: `JAVAIDE_BREAKPOINTS="Main.java:9,src/A.java:12"` (1-based lines).
@@ -235,6 +249,7 @@ final class Workspace {
         selectedRunID = nil
         modules = []
         runTargets = []
+        springConfigIndexes = [:]
         selectedRunTargetID = UserDefaults.standard.string(forKey: "runTarget:" + Self.key(for: url))
         fileWatcher = FileWatcher(url: url, ignoredComponents: FileNode.ignoredNames.union([".git"])) { [weak self] in
             self?.reloadTree()
@@ -319,6 +334,7 @@ final class Workspace {
             return
         }
         open(OpenDocument(url: url, text: contents))
+        if SpringConfigEditing.fileKind(url) != nil { Task { _ = await springConfigIndex(for: url) } }
     }
 
     private func open(_ document: OpenDocument) {
@@ -556,6 +572,7 @@ final class Workspace {
             }
             if Self.isJava(document.url), isDebugging { scheduleHotCodeReplace() }
             if Self.isBuildFile(document.url) {
+                springConfigIndexes = [:]
                 try? lsp?.notify("workspace/didChangeWatchedFiles", params: [
                     "changes": [["uri": .string(document.url.absoluteString), "type": 2]],
                 ])
@@ -601,7 +618,18 @@ final class Workspace {
 
     // MARK: - Language features
 
+    /// The Spring config file kind of the current file (application*.properties / .yml), if any.
+    var springConfigKind: SpringConfigEditing.FileKind? {
+        guard let currentFile, !isReadOnly(currentFile) else { return nil }
+        return SpringConfigEditing.fileKind(currentFile)
+    }
+
     func completions(at offset: Int) async -> [CompletionItem] {
+        if let kind = springConfigKind, let url = currentFile {
+            let text = self.text
+            guard let index = await springConfigIndex(for: url) else { return [] }
+            return SpringConfigEditing.completions(index: index, text: text, offset: offset, kind: kind)
+        }
         guard case let (lsp, params)? = positionRequest(at: offset),
               let result = try? await lsp.request("textDocument/completion", params: params)
         else { return [] }
@@ -609,10 +637,49 @@ final class Workspace {
     }
 
     func hover(at offset: Int) async -> String? {
+        if let kind = springConfigKind, let url = currentFile {
+            let text = self.text
+            guard let index = await springConfigIndex(for: url) else { return nil }
+            return SpringConfigEditing.hover(index: index, text: text, offset: offset, kind: kind)
+        }
         guard case let (lsp, params)? = positionRequest(at: offset),
               let result = try? await lsp.request("textDocument/hover", params: params)
         else { return nil }
         return HoverContent.parse(result).map { String($0.prefix(4000)) }
+    }
+
+    /// The configuration metadata on the class path of the module holding `file`, from jdtls
+    /// (`java.project.getClasspaths`). Reloaded after 30 s so a rebuilt `@ConfigurationProperties`
+    /// class (whose metadata lands in target/classes) shows up; jar contents are cached.
+    func springConfigIndex(for file: URL) async -> SpringConfigIndex? {
+        guard let rootURL else { return nil }
+        let module = ProjectModules.module(containing: file, in: modules, root: rootURL)
+        let key = Self.key(for: module?.directory(root: rootURL) ?? rootURL)
+        if let cached = springConfigIndexes[key], ContinuousClock.now - cached.loaded < .seconds(30) {
+            return cached.index
+        }
+        if let loading = springConfigLoads[key] { return await loading.value ?? springConfigIndexes[key]?.index }
+        guard let lsp, lspReady else { return springConfigIndexes[key]?.index }
+        let cache = springMetadataCache
+        let task = Task<SpringConfigIndex?, Never> {
+            guard let result = try? await lsp.request("workspace/executeCommand", params: [
+                "command": "java.project.getClasspaths",
+                "arguments": [.string(file.absoluteString), .string(#"{"scope":"runtime"}"#)],
+            ]) else { return nil }
+            let classpath = result["classpaths"]?.arrayValue?.compactMap(\.stringValue) ?? []
+            guard !classpath.isEmpty else { return nil }
+            return await Task.detached(priority: .userInitiated) {
+                SpringConfigIndex.load(classpath: classpath, cache: cache)
+            }.value
+        }
+        springConfigLoads[key] = task
+        let index = await task.value
+        springConfigLoads[key] = nil
+        if let index {
+            springConfigIndexes[key] = (index, ContinuousClock.now)
+            if index.isEmpty { flashStatus("No Spring Boot configuration metadata on this module's class path") }
+        }
+        return index ?? springConfigIndexes[key]?.index
     }
 
     func jumpToDefinition(at offset: Int) async {

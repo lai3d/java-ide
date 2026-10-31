@@ -95,6 +95,9 @@ struct JavaIDEApp: App {
                     .disabled(workspace.documents.count < 2)
             }
             CommandMenu("Code") {
+                Button("Show Completions") { workspace.completionRequest = UUID() }
+                    .keyboardShortcut(.escape, modifiers: [.option])
+                    .disabled(!(workspace.isJavaFile || workspace.springConfigKind != nil) || workspace.isReadOnly)
                 Button("Show Quick Fixes") { workspace.requestQuickFixes() }
                     .keyboardShortcut(.return, modifiers: [.option])
                     .disabled(!workspace.isJavaFile || workspace.isReadOnly)
