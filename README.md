@@ -26,6 +26,7 @@ Sibling project of [golang-ide](https://github.com/lai3d/golang-ide), [python-id
   - **Gradle** (`build.gradle[.kts]`, uses `./gradlew` if present): Run = `gradle run` with the application plugin, else `classes` + `java`; Test = `gradle test [--tests …]`
   - **Plain sources**: compiles every non-test `.java` file with `javac` into a cache folder (your project stays clean) and runs the class
 - Run (⌘R) runs the current class if it has a `main` method, else the first one found; Build (⌘B), Test (⌘U), Stop (⌘.)
+- **Debugger** (Microsoft's java-debug, running inside jdtls): click a line number (or ⌘F8) for a breakpoint, right-click it for a **conditional breakpoint**; **Debug** (⇧⌘D or the ladybug) launches the current class (Maven/Gradle dependencies on the class path) and pauses on breakpoints and uncaught exceptions. Continue ⌃⌘Y, Step Over F8, Into F7, Out ⇧F8, Stop ⌘.; the Debug panel shows the call stack, expandable variables, and a console that evaluates Java expressions in the selected frame (or feeds the program's stdin while it runs). The first Debug asks to download the java-debug plugin (~3 MB, checksum-verified) from Maven Central into `~/Library/Application Support/JavaIDE/java-debug`
 - Output panel with a **stdin field** while a program runs, so `Scanner(System.in)` works (plus an EOF button)
 - **JShell panel** (⌃⌘P) with the project's compiled classes on the class path; **Send Selection to JShell** (⌃↩)
 - **JDK picker** in the status bar and *Java ▸ JDK*: lists every JDK registered with macOS (`/usr/libexec/java_home -V`), or browse for one. The chosen JDK is used for running, building and JShell, and is passed to jdtls as the project runtime
@@ -39,6 +40,8 @@ Sibling project of [golang-ide](https://github.com/lai3d/golang-ide), [python-id
 - jdtls: `brew install jdtls` (it brings its own JDK 21+ to run on)
 - Optional: `maven` / `gradle` (`brew install maven gradle`) if your projects don't ship `mvnw` / `gradlew`
 
+For scripted testing, `JAVAIDE_BREAKPOINTS="Main.java:9"` sets breakpoints (path relative to the folder, 1-based line) when a folder is opened from the command line.
+
 JavaIDE looks for tools on `PATH`, `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin` and SDKMAN's folders, so it works when launched from Finder too. jdtls keeps its per-project index in `~/Library/Caches/JavaIDE/` (*Java ▸ Clean Language Server Workspace* resets it).
 
 ## Build & run
@@ -46,7 +49,7 @@ JavaIDE looks for tools on `PATH`, `/opt/homebrew/bin`, `/usr/local/bin`, `~/.lo
 ```sh
 swift run JavaIDE Examples/hello        # plain sources
 swift run JavaIDE Examples/maven-demo   # Maven + JUnit 5
-swift test                              # unit tests + a jdtls end-to-end test
+swift test                              # unit tests + jdtls and debugger end-to-end tests
 ./scripts/bundle.sh                     # build build/JavaIDE.app (release, ad-hoc signed)
 open build/JavaIDE.app
 ```
@@ -57,15 +60,15 @@ The first time jdtls opens a Maven or Gradle project it imports it (downloading 
 
 | Path | What |
 |---|---|
-| `Sources/JavaIDECore` | UI-independent core: JSON-RPC/LSP client, message framing, Java highlighter & indent rules, JDK / jdtls / build-system discovery, run commands, code actions, LSP position math, file tree |
+| `Sources/JavaIDECore` | UI-independent core: JSON-RPC/LSP client, DAP client (stdio or TCP), java-debug installer, message framing, Java highlighter & indent rules, JDK / jdtls / build-system discovery, run commands, code actions, LSP position math, file tree |
 | `Sources/JavaIDE` | SwiftUI app: workspace state, editor view, sidebar, panels |
-| `Tests/JavaIDECoreTests` | swift-testing tests (the jdtls test runs when `jdtls` is installed) |
+| `Tests/JavaIDECoreTests` | swift-testing tests (the jdtls / debugger tests run when `jdtls` and the java-debug jar are installed) |
 | `Examples/hello` | Plain-javac project |
 | `Examples/maven-demo` | Maven project with a JUnit 5 test |
 
 ## Roadmap
 
-- Debugger (java-debug over DAP via jdtls) — breakpoints can already be toggled in the gutter
+- Debugger: watch expressions, hot code replace, attach to a running JVM
 - Clickable stack traces and compiler errors in the Output panel
 - Test explorer with per-method runs
 - Maven/Gradle dependency tree sidebar

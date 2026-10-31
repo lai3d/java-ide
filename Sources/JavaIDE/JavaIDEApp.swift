@@ -96,10 +96,6 @@ struct JavaIDEApp: App {
                     .disabled(!workspace.isJavaFile || workspace.isReadOnly)
                 Toggle("Format on Save", isOn: Bindable(workspace).formatOnSave)
                 Toggle("Organize Imports on Save", isOn: Bindable(workspace).organizeImportsOnSave)
-                Divider()
-                Button("Toggle Breakpoint") { workspace.toggleBreakpointAtCaret() }
-                    .keyboardShortcut("\\", modifiers: [.command])
-                    .disabled(!workspace.isJavaFile)
             }
             CommandMenu("Run") {
                 Button("Run") { workspace.run(.run) }
@@ -127,6 +123,34 @@ struct JavaIDEApp: App {
                     .disabled(!workspace.isJavaFile)
                 Button("Restart JShell") { workspace.restartREPL() }
                     .disabled(workspace.rootURL == nil)
+            }
+            CommandMenu("Debug") {
+                Button("Debug") { Task { await workspace.startDebugging() } }
+                    .keyboardShortcut("d", modifiers: [.shift, .command])
+                    .disabled(workspace.rootURL == nil || workspace.isDebugging || workspace.isRunning)
+                Button("Stop Debugging") { workspace.stopDebugging() }
+                    .disabled(!workspace.isDebugging)
+                Divider()
+                Button("Continue") { workspace.debugSession?.resume() }
+                    .keyboardShortcut("y", modifiers: [.control, .command])
+                    .disabled(workspace.debugSession?.isStopped != true)
+                Button("Pause") { workspace.debugSession?.pause() }
+                    .disabled(workspace.debugSession?.state != .running)
+                Button("Step Over") { workspace.debugSession?.stepOver() }
+                    .keyboardShortcut(KeyEquivalent(Character(UnicodeScalar(NSF8FunctionKey)!)), modifiers: [])
+                    .disabled(workspace.debugSession?.isStopped != true)
+                Button("Step Into") { workspace.debugSession?.stepIn() }
+                    .keyboardShortcut(KeyEquivalent(Character(UnicodeScalar(NSF7FunctionKey)!)), modifiers: [])
+                    .disabled(workspace.debugSession?.isStopped != true)
+                Button("Step Out") { workspace.debugSession?.stepOut() }
+                    .keyboardShortcut(KeyEquivalent(Character(UnicodeScalar(NSF8FunctionKey)!)), modifiers: [.shift])
+                    .disabled(workspace.debugSession?.isStopped != true)
+                Divider()
+                Button("Toggle Breakpoint") { workspace.toggleBreakpointAtCaret() }
+                    .keyboardShortcut(KeyEquivalent(Character(UnicodeScalar(NSF8FunctionKey)!)), modifiers: [.command])
+                    .disabled(!workspace.isJavaFile)
+                Button("Clear All Breakpoints") { workspace.clearAllBreakpoints() }
+                    .disabled(workspace.breakpoints.isEmpty)
             }
             CommandMenu("Java") {
                 Menu("JDK") {

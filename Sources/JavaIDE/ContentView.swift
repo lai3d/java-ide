@@ -33,11 +33,16 @@ struct ContentView: View {
                 }
                 .help("Run the current class's main method (⌘R)")
                 .disabled(workspace.isRunning)
+                Button { Task { await workspace.startDebugging() } } label: {
+                    Label("Debug", systemImage: "ladybug")
+                }
+                .help("Debug the current class (⇧⌘D)")
+                .disabled(workspace.isRunning || workspace.isDebugging)
                 Button { workspace.stopRun() } label: {
                     Label("Stop", systemImage: "stop.fill")
                 }
                 .help("Stop (⌘.)")
-                .disabled(!workspace.isRunning)
+                .disabled(!workspace.isRunning && !workspace.isDebugging)
             }
         }
         .task { await workspace.handleLaunchArguments() }
@@ -189,6 +194,8 @@ struct EditorArea: View {
                         isEditable: !workspace.isReadOnly,
                         diagnostics: workspace.currentDiagnostics,
                         breakpointLines: workspace.currentBreakpoints,
+                        conditionalBreakpointLines: workspace.currentConditionalBreakpoints,
+                        executionLine: workspace.currentExecutionLine,
                         reveal: workspace.revealTarget,
                         quickFixRequest: workspace.quickFixRequest,
                         services: EditorServices(
@@ -201,6 +208,8 @@ struct EditorArea: View {
                             codeActions: { await workspace.codeActions(at: $0) },
                             performCodeAction: { action in Task { await workspace.perform(action) } },
                             toggleBreakpoint: { workspace.toggleBreakpoint(line: $0) },
+                            editBreakpointCondition: { workspace.editBreakpointCondition(line: $0) },
+                            removeBreakpoint: { workspace.removeBreakpoint(line: $0) },
                             caretMoved: {
                                 workspace.caretOffset = $0.location
                                 workspace.selectedRange = $0
@@ -335,6 +344,7 @@ struct BottomPanel: View {
                     Text("Problems (\(workspace.allProblems.count))").tag(BottomTab.problems)
                     Text("Output").tag(BottomTab.output)
                     Text("JShell").tag(BottomTab.repl)
+                    Text(workspace.isDebugging ? "Debug ●" : "Debug").tag(BottomTab.debug)
                     if !workspace.references.isEmpty || workspace.bottomTab == .references {
                         Text("References (\(workspace.references.count))").tag(BottomTab.references)
                     }
@@ -377,6 +387,7 @@ struct BottomPanel: View {
             case .output: OutputView()
             case .references: ReferencesList()
             case .repl: REPLView()
+            case .debug: DebugPanel()
             }
         }
     }

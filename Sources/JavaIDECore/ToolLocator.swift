@@ -322,8 +322,9 @@ public enum LanguageServerSpec {
         return ["java": .object(java)]
     }
 
-    public static func initializationOptions(jdk: JDK?) -> JSONValue {
+    public static func initializationOptions(jdk: JDK?, bundles: [URL] = []) -> JSONValue {
         [
+            "bundles": .array(bundles.map { .string($0.path) }),
             "settings": settings(jdk: jdk),
             "extendedClientCapabilities": [
                 "classFileContentsSupport": true,

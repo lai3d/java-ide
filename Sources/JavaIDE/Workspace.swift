@@ -3,7 +3,13 @@ import JavaIDECore
 import Observation
 
 enum BottomTab: Hashable {
-    case problems, output, references, repl
+    case problems, output, references, repl, debug
+}
+
+/// Where a paused debugger is (normalized path, zero-based line).
+struct ExecutionLocation: Equatable {
+    let key: String
+    let line: Int
 }
 
 /// One result of Find References, with its source line for context.
@@ -94,6 +100,8 @@ final class Workspace {
 
     /// Breakpoints per normalized path: zero-based line → condition ("" when unconditional).
     private(set) var breakpoints: [String: [Int: String]] = [:]
+    private(set) var debugSession: DebugSession?
+    private(set) var executionLocation: ExecutionLocation?
 
     private(set) var replOutput = ""
     private(set) var isREPLRunning = false
@@ -101,6 +109,10 @@ final class Workspace {
 
     @ObservationIgnored private var lsp: LSPClient?
     @ObservationIgnored private var lspReady = false
+    /// jdtls finished importing the project (`language/status` ServiceReady).
+    @ObservationIgnored private var lspServiceReady = false
+    /// Whether the running jdtls was started with the java-debug bundle.
+    @ObservationIgnored private var lspHasDebugBundle = false
     @ObservationIgnored private var runProcess: Process?
     @ObservationIgnored private var runInput: FileHandle?
     @ObservationIgnored private var handledLaunchArguments = false
@@ -168,13 +180,29 @@ final class Workspace {
             let url = URL(fileURLWithPath: arg).standardizedFileURL
             if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
                 await openFolder(url)
+                applyLaunchBreakpoints(root: url)
                 return
             }
         }
     }
 
+    /// Dev aid for scripted testing: `JAVAIDE_BREAKPOINTS="Main.java:9,src/A.java:12"` (1-based lines).
+    private func applyLaunchBreakpoints(root: URL) {
+        guard let spec = ProcessInfo.processInfo.environment["JAVAIDE_BREAKPOINTS"] else { return }
+        for item in spec.split(separator: ",") {
+            let parts = item.split(separator: ":")
+            guard parts.count == 2, let line = Int(parts[1]), line > 0 else { continue }
+            let key = Self.key(for: root.appendingPathComponent(String(parts[0])))
+            var lines = breakpoints[key] ?? [:]
+            lines[line - 1] = ""
+            updateBreakpoints(lines, for: key)
+        }
+    }
+
     func openFolder(_ url: URL) async {
         guard confirmDiscardOrSave(documents.filter(\.isDirty)) else { return }
+        stopDebugging()
+        debugSession = nil
         breakpoints = [:]
         stopREPL()
         replOutput = ""
@@ -370,7 +398,7 @@ final class Workspace {
         let key = documents[index].id
         if let lines = breakpoints[key], !lines.isEmpty {
             let moved = LineShift.remap(lines, old: documents[index].text, new: newText)
-            if moved != lines { breakpoints[key] = moved.isEmpty ? nil : moved }
+            if moved != lines { updateBreakpoints(moved, for: key) }
         }
         documents[index].text = newText
         documents[index].isDirty = documents[index].lspURI == nil
@@ -818,6 +846,7 @@ final class Workspace {
             return
         }
         let jdk = self.jdk
+        let debugJar = JavaDebugLocator.installedJar
         let client = LSPClient()
         client.configurationProvider = { items in
             LanguageServerSpec.configuration(items: items, jdk: jdk)
@@ -848,7 +877,9 @@ final class Workspace {
                              currentDirectory: root)
             lsp = client
             lspStatus = "\(name): starting…"
-            _ = try await client.request("initialize", params: Self.initializeParams(root: root, jdk: jdk))
+            lspServiceReady = false
+            _ = try await client.request("initialize", params: Self.initializeParams(root: root, jdk: jdk, bundles: debugJar.map { [$0] } ?? []))
+            lspHasDebugBundle = debugJar != nil
             guard lsp === client else { return }  // folder changed while initializing
             try client.notify("initialized", params: [:])
             try client.notify("workspace/didChangeConfiguration", params: ["settings": LanguageServerSpec.settings(jdk: jdk)])
@@ -898,6 +929,7 @@ final class Workspace {
             let message = params["message"]?.stringValue ?? ""
             switch type {
             case "ServiceReady":
+                lspServiceReady = true
                 lspStatus = "jdtls: ready"
                 scheduleOutlineRefresh(after: .zero)
             case "Started":
@@ -938,7 +970,7 @@ final class Workspace {
         try? lsp?.notify("textDocument/didClose", params: ["textDocument": ["uri": .string(document.uri)]])
     }
 
-    private static func initializeParams(root: URL, jdk: JDK?) -> JSONValue {
+    private static func initializeParams(root: URL, jdk: JDK?, bundles: [URL]) -> JSONValue {
         let textDocument: JSONValue = [
             "synchronization": ["didSave": true, "dynamicRegistration": false],
             "publishDiagnostics": ["relatedInformation": false],
@@ -975,7 +1007,7 @@ final class Workspace {
             "clientInfo": ["name": "JavaIDE", "version": "0.1.0"],
             "rootUri": .string(root.absoluteString),
             "workspaceFolders": [["uri": .string(root.absoluteString), "name": .string(root.lastPathComponent)]],
-            "initializationOptions": LanguageServerSpec.initializationOptions(jdk: jdk),
+            "initializationOptions": LanguageServerSpec.initializationOptions(jdk: jdk, bundles: bundles),
             "capabilities": [
                 "textDocument": textDocument,
                 "workspace": workspace,
@@ -1097,6 +1129,10 @@ final class Workspace {
     }
 
     func stopRun() {
+        if isDebugging, runProcess == nil {
+            stopDebugging()
+            return
+        }
         guard let runProcess else { return }
         // Commands `exec` the final tool, so SIGINT reaches the JVM / Maven / Gradle directly.
         runProcess.interrupt()
@@ -1111,9 +1147,29 @@ final class Workspace {
         if output.utf16.count > 1_000_000 { output = String(output.suffix(800_000)) }
     }
 
-    // MARK: - Breakpoints (gutter state; the debugger is not wired up yet)
+    // MARK: - Debugging (java-debug inside jdtls)
+
+    var isDebugging: Bool { debugSession?.isActive ?? false }
 
     var currentBreakpoints: Set<Int> { Set((breakpoints[currentDocumentID] ?? [:]).keys) }
+
+    var currentConditionalBreakpoints: Set<Int> {
+        Set((breakpoints[currentDocumentID] ?? [:]).filter { !$0.value.isEmpty }.keys)
+    }
+
+    var currentExecutionLine: Int? {
+        guard let executionLocation, executionLocation.key == currentDocumentID else { return nil }
+        return executionLocation.line
+    }
+
+    private static func sourceBreakpoints(_ lines: [Int: String]) -> [SourceBreakpoint] {
+        lines.map { SourceBreakpoint(line: $0.key + 1, condition: $0.value.isEmpty ? nil : $0.value) }
+    }
+
+    private func updateBreakpoints(_ lines: [Int: String], for key: String) {
+        breakpoints[key] = lines.isEmpty ? nil : lines
+        debugSession?.setBreakpoints(path: key, Self.sourceBreakpoints(lines))
+    }
 
     func toggleBreakpointAtCaret() {
         toggleBreakpoint(line: LineIndex(text).position(of: caretOffset).line)
@@ -1124,7 +1180,148 @@ final class Workspace {
         let key = currentDocumentID
         var lines = breakpoints[key] ?? [:]
         if lines[line] != nil { lines.removeValue(forKey: line) } else { lines[line] = "" }
-        breakpoints[key] = lines.isEmpty ? nil : lines
+        updateBreakpoints(lines, for: key)
+    }
+
+    /// Asks for a Java boolean expression; the breakpoint only pauses when it is true.
+    func editBreakpointCondition(line: Int) {
+        let key = currentDocumentID
+        let alert = NSAlert()
+        alert.messageText = "Breakpoint condition (line \(line + 1))"
+        alert.informativeText = "Pause only when this Java expression is true. Leave empty to always pause."
+        let field = NSTextField(string: breakpoints[key]?[line] ?? "")
+        field.placeholderString = "e.g. i == 3"
+        field.frame = NSRect(x: 0, y: 0, width: 280, height: 24)
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Set")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        var lines = breakpoints[key] ?? [:]
+        lines[line] = field.stringValue.trimmingCharacters(in: .whitespaces)
+        updateBreakpoints(lines, for: key)
+    }
+
+    func removeBreakpoint(line: Int) {
+        var lines = breakpoints[currentDocumentID] ?? [:]
+        lines.removeValue(forKey: line)
+        updateBreakpoints(lines, for: currentDocumentID)
+    }
+
+    func clearAllBreakpoints() {
+        for key in breakpoints.keys { debugSession?.setBreakpoints(path: key, []) }
+        breakpoints = [:]
+    }
+
+    /// Debugs the current class (or the project's first main class) under java-debug.
+    func startDebugging() async {
+        guard let rootURL, !isDebugging, !isRunning else { return }
+        guard let jdk else {
+            flashStatus("No JDK found — choose one in the status bar")
+            return
+        }
+        saveAllNow()
+        if JavaDebugLocator.installedJar == nil {
+            guard await installJavaDebug() else { return }
+        }
+        if !lspHasDebugBundle || lsp == nil {
+            lspStatus = "jdtls: restarting with the debugger…"
+            await restartLanguageServer()
+        }
+        guard let lsp, await waitForServiceReady() else {
+            flashStatus("jdtls is not ready — try again when the status bar says ready")
+            return
+        }
+        bottomTab = .debug
+        do {
+            // 1. Which main class, in which jdtls project.
+            let mains = try await lsp.request("workspace/executeCommand", params: [
+                "command": "vscode.java.resolveMainClass", "arguments": [.string(rootURL.absoluteString)],
+            ]).arrayValue ?? []
+            let currentKey = currentFile.map(Self.key(for:))
+            let entry = mains.first { m in m["filePath"]?.stringValue.map { Self.key(for: URL(fileURLWithPath: $0)) } == currentKey }
+                ?? mains.first
+            guard let entry, let mainClass = entry["mainClass"]?.stringValue else {
+                flashStatus("No main class found to debug")
+                return
+            }
+            let projectName = entry["projectName"]?.stringValue ?? ""
+            // 2. Its class path (includes Maven/Gradle dependencies).
+            let paths = try await lsp.request("workspace/executeCommand", params: [
+                "command": "vscode.java.resolveClasspath", "arguments": [.string(mainClass), .string(projectName)],
+            ])
+            // 3. A debug adapter listening on a local port.
+            let portResult = try await lsp.request("workspace/executeCommand", params: ["command": "vscode.java.startDebugSession"])
+            guard let port = portResult.intValue else {
+                flashStatus("java-debug did not start (is the bundle loaded?)")
+                return
+            }
+            let launch: JSONValue = [
+                "type": "java", "request": "launch", "name": .string(mainClass),
+                "mainClass": .string(mainClass), "projectName": .string(projectName),
+                "modulePaths": paths[0] ?? .array([]), "classPaths": paths[1] ?? .array([]),
+                "cwd": .string(rootURL.path), "console": "integratedTerminal",
+                "javaExec": .string(jdk.java.path), "args": "", "vmArgs": "", "stopOnEntry": false,
+                "encoding": "UTF-8",
+            ]
+            startSession(port: port, launch: launch, programName: mainClass, jdk: jdk)
+        } catch {
+            flashStatus("Debug failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func startSession(port: Int, launch: JSONValue, programName: String, jdk: JDK) {
+        let session = DebugSession(breakpoints: breakpoints.mapValues(Self.sourceBreakpoints), programName: programName)
+        session.onLocation = { [weak self, weak session] location in
+            guard let self, self.debugSession === session else { return }
+            guard let (path, line) = location else {
+                self.executionLocation = nil
+                return
+            }
+            let url = URL(fileURLWithPath: path)
+            self.executionLocation = ExecutionLocation(key: Self.key(for: url), line: max(line - 1, 0))
+            self.navigate(to: url, position: TextPosition(line: max(line - 1, 0), character: 0))
+            self.bottomTab = .debug
+        }
+        session.onEnd = { [weak self, weak session] in
+            guard let self, self.debugSession === session else { return }
+            self.executionLocation = nil
+        }
+        debugSession = session
+        bottomTab = .debug
+        session.start(port: port, launchArguments: launch, environment: ToolLocator.environment(jdk: jdk))
+    }
+
+    func stopDebugging() {
+        debugSession?.stop()
+    }
+
+    private func waitForServiceReady(timeout: Duration = .seconds(120)) async -> Bool {
+        let deadline = ContinuousClock.now + timeout
+        while !lspServiceReady, lsp != nil, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(200))
+        }
+        return lspServiceReady && lsp != nil
+    }
+
+    /// Asks, then downloads Microsoft's java-debug plugin from Maven Central (checksum-verified).
+    private func installJavaDebug() async -> Bool {
+        let alert = NSAlert()
+        alert.messageText = "Download the Java debugger?"
+        alert.informativeText = "Debugging uses Microsoft's java-debug plugin for jdtls (\(JavaDebugLocator.jarName), ~3 MB). "
+            + "JavaIDE downloads it from Maven Central into \(JavaDebugLocator.supportDirectory.path) and verifies its checksum."
+        alert.addButton(withTitle: "Download")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return false }
+        lspStatus = "Downloading java-debug…"
+        do {
+            _ = try await JavaDebugLocator.install()
+            lspStatus = "java-debug installed"
+            return true
+        } catch {
+            flashStatus("java-debug download failed: \(error.localizedDescription)")
+            return false
+        }
     }
 
     // MARK: - REPL (jshell)
