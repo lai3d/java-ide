@@ -1,0 +1,13 @@
+.build/
+build/
+.swiftpm/
+*.xcodeproj
+xcuserdata/
+.DS_Store
+Examples/*/target/
+Examples/*/out/
+# Eclipse metadata that jdtls generates for Maven/Gradle projects
+.project
+.classpath
+.settings/
+.factorypath
