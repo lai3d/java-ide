@@ -27,6 +27,12 @@ struct JavaIDEApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var workspace = Workspace()
 
+    init() {
+        // Don't restore window state: a saved "no windows open" state (e.g. after the app was killed)
+        // would otherwise relaunch it with no window at all. The workspace reopens its own folder.
+        UserDefaults.standard.register(defaults: ["ApplePersistenceIgnoreState": true])
+    }
+
     var body: some Scene {
         WindowGroup("JavaIDE") {
             ContentView()
