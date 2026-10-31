@@ -7,8 +7,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Writing to a dead language server's stdin must not kill the app.
         signal(SIGPIPE, SIG_IGN)
-        // Only for a bare SwiftPM executable (`swift run`, no .app bundle). In a bundled app built
-        // against the macOS 26 SDK, these calls stop SwiftUI from opening the first window at all.
+        // Only needed for a bare SwiftPM executable (`swift run`, no .app bundle); a bundled app is
+        // already a regular, activatable app.
         if Bundle.main.bundleIdentifier == nil {
             NSApp.setActivationPolicy(.regular)
             NSApp.activate(ignoringOtherApps: true)
@@ -29,6 +29,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 struct JavaIDEApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var workspace = Workspace()
+
+    init() {
+        // `JavaIDE <folder>` passes the folder in argv. By default AppKit also treats such arguments as
+        // documents to open, and apps built against the macOS 26 SDK then skip their first window.
+        // The folder is handled by Workspace.handleLaunchArguments instead.
+        UserDefaults.standard.register(defaults: ["NSTreatUnknownArgumentsAsOpen": "NO"])
+    }
 
 
     var body: some Scene {
