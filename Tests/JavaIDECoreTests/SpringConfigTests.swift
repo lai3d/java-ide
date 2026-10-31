@@ -75,10 +75,13 @@ import Testing
         #expect(SpringConfigEditing.fileKind(URL(fileURLWithPath: "/r/messages.properties")) == nil)
     }
 
-    @Test func readsMetadataFromRealJar() throws {
-        let jar = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".m2/repository/org/springframework/boot/spring-boot-autoconfigure/3.5.16/spring-boot-autoconfigure-3.5.16.jar")
-        try #require(FileManager.default.fileExists(atPath: jar.path), "Spring Boot not in ~/.m2")
+    static let autoconfigureJar = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".m2/repository/org/springframework/boot/spring-boot-autoconfigure/3.5.16/spring-boot-autoconfigure-3.5.16.jar")
+
+    /// Needs Spring Boot in the local Maven repository (run the Spring examples once); skipped otherwise, e.g. on CI.
+    @Test(.enabled(if: FileManager.default.fileExists(atPath: SpringConfigTests.autoconfigureJar.path)))
+    func readsMetadataFromRealJar() throws {
+        let jar = Self.autoconfigureJar
         let cache = MetadataCache()
         let index = SpringConfigIndex.load(classpath: [jar.path, "/nonexistent.jar"], cache: cache)
         #expect(index.properties["server.port"]?.type == "java.lang.Integer")
