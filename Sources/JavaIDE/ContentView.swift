@@ -5,6 +5,7 @@ struct ContentView: View {
     @Environment(Workspace.self) private var workspace
 
     var body: some View {
+        @Bindable var workspace = workspace
         NavigationSplitView {
             Sidebar()
                 .navigationSplitViewColumnWidth(min: 180, ideal: 240)
@@ -22,30 +23,121 @@ struct ContentView: View {
                     Label("Build", systemImage: "hammer")
                 }
                 .help("Compile with \(workspace.buildSystem.displayName) (⌘B)")
-                .disabled(workspace.isRunning)
+                .disabled(workspace.isRunning(key: "build"))
                 Button { workspace.run(.test) } label: {
                     Label("Test", systemImage: "checkmark.diamond")
                 }
                 .help("Run tests — the current test class, or all (⌘U)")
-                .disabled(workspace.isRunning)
+                .disabled(workspace.isRunning(key: "test"))
+                RunTargetMenu()
                 Button { workspace.run(.run) } label: {
                     Label("Run", systemImage: "play.fill")
                 }
-                .help("Run the current class's main method (⌘R)")
-                .disabled(workspace.isRunning)
+                .help("Run \(workspace.runTargetLabel == "Current File" ? "the current class's main method" : workspace.runTargetLabel) (⌘R); runs again if it is already running")
                 Button { Task { await workspace.startDebugging() } } label: {
                     Label("Debug", systemImage: "ladybug")
                 }
-                .help("Debug the current class (⇧⌘D)")
-                .disabled(workspace.isRunning || workspace.isDebugging)
+                .help("Debug the Run target (⇧⌘D)")
+                .disabled(workspace.isDebugging)
                 Button { workspace.stopRun() } label: {
                     Label("Stop", systemImage: "stop.fill")
                 }
-                .help("Stop (⌘.)")
+                .help("Stop the selected program (⌘.)")
                 .disabled(!workspace.isRunning && !workspace.isDebugging)
             }
         }
+        .sheet(item: $workspace.editingRunTarget) { target in
+            RunConfigurationSheet(target: target, configuration: workspace.runConfiguration(for: target))
+        }
         .task { await workspace.handleLaunchArguments() }
+    }
+}
+
+/// Toolbar picker for what Run / Debug start, plus run configuration and Run All.
+struct RunTargetMenu: View {
+    @Environment(Workspace.self) private var workspace
+
+    var body: some View {
+        Menu {
+            Button(check(nil) + "Current File") { workspace.selectedRunTargetID = nil }
+            if !workspace.runTargets.isEmpty { Divider() }
+            ForEach(workspace.runTargets) { target in
+                Button {
+                    workspace.selectedRunTargetID = target.id
+                } label: {
+                    Label(check(target.id) + target.displayName, systemImage: target.isSpringBoot ? "leaf" : "play")
+                }
+            }
+            Divider()
+            Button("Edit Run Configuration…") { workspace.editRunConfiguration() }
+            if workspace.springBootTargets.count > 1 {
+                Button("Run All Spring Boot Apps (\(workspace.springBootTargets.count))") { workspace.runAllSpringBootApps() }
+            }
+            if workspace.runSessions.filter(\.isRunning).count > 1 {
+                Button("Stop All") { workspace.stopAll() }
+            }
+        } label: {
+            Label(workspace.runTargetLabel, systemImage: workspace.currentRunTarget?.isSpringBoot == true ? "leaf" : "scope")
+                .labelStyle(.titleAndIcon)
+        }
+        .help("Run target: what Run and Debug start")
+        .fixedSize()
+    }
+
+    private func check(_ id: String?) -> String { workspace.selectedRunTargetID == id ? "✓ " : "" }
+}
+
+/// Spring profiles, program arguments, JVM options and environment variables for one Run target.
+struct RunConfigurationSheet: View {
+    @Environment(Workspace.self) private var workspace
+    @Environment(\.dismiss) private var dismiss
+    let target: RunTarget
+    @State var configuration: RunConfiguration
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Run Configuration").font(.headline)
+            Text(target.mainClass + (target.module.isRoot ? "" : " — module \(target.module.relativePath)"))
+                .font(.callout).foregroundStyle(.secondary)
+            Form {
+                if target.isSpringBoot {
+                    TextField("Active profiles", text: $configuration.profiles, prompt: Text("dev, local"))
+                }
+                TextField("Program arguments", text: $configuration.programArguments,
+                          prompt: Text(target.isSpringBoot ? "--server.port=8081" : "arg1 \"arg two\""))
+                TextField("VM options", text: $configuration.vmOptions, prompt: Text("-Xmx512m -Dfoo=bar"))
+                LabeledContent("Environment") {
+                    TextEditor(text: $configuration.environment)
+                        .font(.system(.body, design: .monospaced))
+                        .frame(height: 80)
+                        .overlay(alignment: .topLeading) {
+                            if configuration.environment.isEmpty {
+                                Text("NAME=value, one per line").foregroundStyle(.tertiary).padding(.leading, 5).allowsHitTesting(false)
+                            }
+                        }
+                }
+            }
+            if target.isSpringBoot {
+                Text("Profiles are passed as SPRING_PROFILES_ACTIVE. Used by Run and Debug.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("Save") {
+                    workspace.setRunConfiguration(configuration, for: target)
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+                Button("Save & Run") {
+                    workspace.setRunConfiguration(configuration, for: target)
+                    dismiss()
+                    workspace.run(target)
+                }
+            }
+        }
+        .padding(20)
+        .frame(width: 520)
     }
 }
 
@@ -168,6 +260,9 @@ struct FileTreeView: View {
         case "toml", "cfg", "ini", "lock": return "shippingbox"
         case "ipynb": return "book"
         case "md": return "doc.richtext"
+        case "java": return "cup.and.saucer"
+        case "properties", "yml", "yaml": return "gearshape"
+        case "xml", "gradle", "kts": return "shippingbox"
         default: return "doc"
         }
     }
@@ -191,6 +286,7 @@ struct EditorArea: View {
                         openDocumentIDs: Set(workspace.documents.map(\.id)),
                         text: workspace.text,
                         highlightCode: workspace.isJavaFile,
+                        language: workspace.currentFile.map(SyntaxLanguage.forFile) ?? .none,
                         isEditable: !workspace.isReadOnly,
                         diagnostics: workspace.currentDiagnostics,
                         breakpointLines: workspace.currentBreakpoints,
@@ -560,6 +656,68 @@ extension ProblemsList {
 
 struct OutputView: View {
     @Environment(Workspace.self) private var workspace
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if workspace.runSessions.count > 1 {
+                RunSessionTabs()
+                Divider()
+            }
+            if let session = workspace.selectedRun {
+                RunSessionView(session: session)
+                    .id(session.id)
+            } else {
+                Text("No output yet. Use Run (⌘R), Test (⌘U) or Build (⌘B).")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+    }
+}
+
+/// One chip per Run / Build / Test session.
+struct RunSessionTabs: View {
+    @Environment(Workspace.self) private var workspace
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 4) {
+                ForEach(workspace.runSessions) { session in
+                    let selected = session.id == workspace.selectedRun?.id
+                    HStack(spacing: 4) {
+                        Circle()
+                            .fill(session.isRunning ? Color.green : (session.exitStatus.map { $0 == 0 || $0 == 130 } ?? true) ? Color.secondary.opacity(0.4) : Color.red)
+                            .frame(width: 7, height: 7)
+                        Text(session.title).font(.caption).lineLimit(1)
+                        Button {
+                            workspace.closeRunSession(session)
+                        } label: {
+                            Image(systemName: "xmark").font(.system(size: 8, weight: .bold))
+                        }
+                        .buttonStyle(.borderless)
+                        .help(session.isRunning ? "Stop and close" : "Close")
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(selected ? Color.accentColor.opacity(0.18) : Color.clear, in: Capsule())
+                    .contentShape(Capsule())
+                    .onTapGesture { workspace.selectedRunID = session.id }
+                    .contextMenu {
+                        if session.isRunning { Button("Stop") { session.stop() } }
+                        Button("Clear") { session.clear() }
+                        Button("Close") { workspace.closeRunSession(session) }
+                    }
+                }
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+        }
+    }
+}
+
+struct RunSessionView: View {
+    @Environment(Workspace.self) private var workspace
+    let session: RunSession
     @State private var input = ""
     @FocusState private var inputFocused: Bool
 
@@ -568,25 +726,24 @@ struct OutputView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     VStack(alignment: .leading, spacing: 0) {
-                        Text(workspace.output.isEmpty ? AttributedString("No output yet. Use Run (⌘R), Test (⌘U) or Build (⌘B).")
-                                                      : OutputLinks.attributed(workspace.output))
+                        Text(OutputLinks.attributed(session.output))
                             .font(.system(.body, design: .monospaced))
                             .environment(\.openURL, OpenURLAction { url in
                                 workspace.openOutputLink(url)
                                 return .handled
                             })
-                            .foregroundStyle(workspace.output.isEmpty ? .secondary : .primary)
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(8)
                         Color.clear.frame(height: 1).id("end")
                     }
                 }
-                .onChange(of: workspace.output) {
+                .onChange(of: session.output) {
                     proxy.scrollTo("end", anchor: .bottom)
                 }
+                .onAppear { proxy.scrollTo("end", anchor: .bottom) }
             }
-            if workspace.isRunning {
+            if session.isRunning {
                 Divider()
                 HStack(spacing: 6) {
                     Image(systemName: "chevron.right").foregroundStyle(.secondary)
@@ -595,14 +752,17 @@ struct OutputView: View {
                         .font(.system(.body, design: .monospaced))
                         .focused($inputFocused)
                         .onSubmit {
-                            workspace.sendInput(input)
+                            session.send(input)
                             input = ""
                             inputFocused = true
                         }
-                    Button("EOF") { workspace.sendEOF() }
+                    Button("EOF") { session.sendEOF() }
                         .buttonStyle(.borderless)
                         .font(.caption)
                         .help("Close stdin (Ctrl-D)")
+                    Button("Stop") { session.stop() }
+                        .buttonStyle(.borderless)
+                        .font(.caption)
                 }
                 .padding(.horizontal, 8)
                 .padding(.vertical, 5)

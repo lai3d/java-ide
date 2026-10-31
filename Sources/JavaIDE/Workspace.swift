@@ -76,8 +76,22 @@ final class Workspace {
     private(set) var lspStatus = "Language server: not started"
     private(set) var jdk: JDK?
     private(set) var buildSystem: BuildSystem = .plain
-    private(set) var output = ""
-    private(set) var isRunning = false
+    /// Run / Build / Test processes, one Output tab each; several can run at once.
+    private(set) var runSessions: [RunSession] = []
+    var selectedRunID: UUID?
+    /// Maven modules / Gradle subprojects (root first).
+    private(set) var modules: [ProjectModule] = []
+    /// Classes with a `main` method, Spring Boot applications first.
+    private(set) var runTargets: [RunTarget] = []
+    /// The Run target picked in the toolbar; nil runs the current file.
+    var selectedRunTargetID: String? {
+        didSet {
+            guard let rootURL else { return }
+            UserDefaults.standard.set(selectedRunTargetID, forKey: "runTarget:" + Self.key(for: rootURL))
+        }
+    }
+    /// The target whose run configuration sheet is open.
+    var editingRunTarget: RunTarget?
     var bottomTab: BottomTab = .problems
     /// Format with jdtls on ⌘S. Persisted across launches.
     var formatOnSave: Bool = UserDefaults.standard.object(forKey: "formatOnSave") as? Bool ?? false {
@@ -120,8 +134,7 @@ final class Workspace {
     @ObservationIgnored private var lspServiceReady = false
     /// Whether the running jdtls was started with the java-debug bundle.
     @ObservationIgnored private var lspHasDebugBundle = false
-    @ObservationIgnored private var runProcess: Process?
-    @ObservationIgnored private var runInput: FileHandle?
+    @ObservationIgnored private var targetScanTask: Task<Void, Never>?
     @ObservationIgnored private var handledLaunchArguments = false
 
     var currentDiagnostics: [Diagnostic] {
@@ -217,15 +230,21 @@ final class Workspace {
         rootURL = url
         ToolboxRecents.record(url)
         fileTree = FileNode.loadTree(at: url)
+        for session in runSessions where session.isRunning { session.stop() }
+        runSessions = []
+        selectedRunID = nil
+        modules = []
+        runTargets = []
+        selectedRunTargetID = UserDefaults.standard.string(forKey: "runTarget:" + Self.key(for: url))
         fileWatcher = FileWatcher(url: url, ignoredComponents: FileNode.ignoredNames.union([".git"])) { [weak self] in
             self?.reloadTree()
         }
         if jdk == nil { jdk = JDK.locate() }
         buildSystem = BuildSystem.detect(root: url)
+        refreshRunTargets()
         currentFile = nil
         documents = []
         diagnostics = [:]
-        output = ""
         backStack = []
         if let first = Self.firstMainFile(in: fileTree) ?? Self.firstJavaFile(in: fileTree) {
             openFile(first)
@@ -238,6 +257,24 @@ final class Workspace {
         fileTree = FileNode.loadTree(at: rootURL)
         let detected = BuildSystem.detect(root: rootURL)
         if detected != buildSystem { buildSystem = detected }
+        refreshRunTargets()
+    }
+
+    /// Rescans modules and main classes off the main thread.
+    private func refreshRunTargets() {
+        guard let rootURL else { return }
+        let files = Self.allJavaFiles(in: fileTree)
+        let buildSystem = buildSystem
+        targetScanTask?.cancel()
+        targetScanTask = Task { [weak self] in
+            let (modules, targets) = await Task.detached(priority: .utility) {
+                let modules = ProjectModules.discover(root: rootURL, buildSystem: buildSystem)
+                return (modules, RunTarget.discover(files: files, root: rootURL, buildSystem: buildSystem, modules: modules))
+            }.value
+            guard !Task.isCancelled, let self, self.rootURL == rootURL else { return }
+            if self.modules != modules { self.modules = modules }
+            if self.runTargets != targets { self.runTargets = targets }
+        }
     }
 
     /// Lets the user pick one of the installed JDKs (or browse for a JDK home).
@@ -278,8 +315,7 @@ final class Workspace {
         }
         if (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true { return }
         guard let contents = try? String(contentsOf: url, encoding: .utf8) else {
-            appendOutput("Cannot open \(url.path) (not UTF-8 text?)\n")
-            bottomTab = .output
+            showMessage("Cannot open \(url.path) (not UTF-8 text?)\n")
             return
         }
         open(OpenDocument(url: url, text: contents))
@@ -526,8 +562,7 @@ final class Workspace {
             }
             return true
         } catch {
-            appendOutput("Save failed: \(error.localizedDescription)\n")
-            bottomTab = .output
+            showMessage("Save failed: \(error.localizedDescription)\n")
             return false
         }
     }
@@ -1027,42 +1062,152 @@ final class Workspace {
 
     // MARK: - Run / test / build
 
+    var selectedRun: RunSession? { runSessions.first { $0.id == selectedRunID } ?? runSessions.last }
+
+    /// Whether anything (Run, Build, Test) is running.
+    var isRunning: Bool { runSessions.contains(where: \.isRunning) }
+
+    func isRunning(key: String) -> Bool { runSessions.contains { $0.key == key && $0.isRunning } }
+
+    var springBootTargets: [RunTarget] { runTargets.filter(\.isSpringBoot) }
+
+    /// What Run / Debug start: the target picked in the toolbar, else the current file's class
+    /// (or the project's first main class).
+    var currentRunTarget: RunTarget? {
+        if let id = selectedRunTargetID, let target = runTargets.first(where: { $0.id == id }) { return target }
+        guard let rootURL, let (file, className) = mainClassTarget() else { return nil }
+        if let known = runTargets.first(where: { $0.mainClass == className }) { return known }
+        let module = ProjectModules.module(containing: file, in: modules, root: rootURL)
+            ?? ProjectModule(name: rootURL.lastPathComponent, relativePath: "")
+        let source = documents.first { $0.id == Self.key(for: file) }?.text ?? (try? String(contentsOf: file, encoding: .utf8)) ?? ""
+        let spring = SpringBoot.isApplicationClass(source) && SpringBoot.uses(module: module, root: rootURL, buildSystem: buildSystem)
+        return RunTarget(mainClass: className, file: file, module: module, isSpringBoot: spring)
+    }
+
+    var runTargetLabel: String {
+        guard let id = selectedRunTargetID, let target = runTargets.first(where: { $0.id == id }) else { return "Current File" }
+        return target.displayName
+    }
+
     func run(_ action: RunAction) {
-        guard let rootURL, !isRunning else { return }
+        guard rootURL != nil else { return }
         guard let jdk else {
-            output = "No JDK found. Install one (brew install openjdk) or choose a JDK from the status bar.\n"
-            bottomTab = .output
+            showMessage("No JDK found. Install one (brew install openjdk) or choose a JDK from the status bar.\n")
             return
         }
         saveAllNow()
-        let command: RunCommand?
         switch action {
         case .run:
-            guard let target = mainClassTarget() else {
-                output = "Nothing to run: open a class with a main method.\n"
-                bottomTab = .output
+            guard let target = currentRunTarget else {
+                showMessage("Nothing to run: open a class with a main method.\n")
                 return
             }
-            command = RunCommand.run(mainClass: target.className, file: target.file, buildSystem: buildSystem,
-                                     root: rootURL, jdk: jdk, sources: Self.allJavaFiles(in: fileTree))
+            run(target, jdk: jdk)
         case .test:
+            guard let rootURL else { return }
             let testClass = currentFile.flatMap { file -> String? in
                 guard let doc = currentDocument, Self.isJava(file), JavaProject.isTestSource(file: file, source: doc.text) else { return nil }
                 return JavaProject.qualifiedClassName(file: file, source: doc.text)
             }
-            command = RunCommand.test(className: testClass, buildSystem: buildSystem, root: rootURL)
+            let command = RunCommand.test(className: testClass, buildSystem: buildSystem, root: rootURL)
+            if command == nil && buildSystem == .plain {
+                showMessage("Running tests needs a Maven (pom.xml) or Gradle (build.gradle) project.\n")
+                return
+            }
+            launch(command, key: "test", title: "Test")
         case .build:
-            command = RunCommand.build(buildSystem: buildSystem, root: rootURL, jdk: jdk,
-                                       sources: Self.allJavaFiles(in: fileTree))
+            guard let rootURL else { return }
+            launch(RunCommand.build(buildSystem: buildSystem, root: rootURL, jdk: jdk, sources: Self.allJavaFiles(in: fileTree)),
+                   key: "build", title: "Build")
         }
-        guard let command else {
-            output = buildSystem == .plain && action == .test
-                ? "Running tests needs a Maven (pom.xml) or Gradle (build.gradle) project.\n"
-                : "\(buildSystem.displayName) not found on PATH (brew install \(buildSystem == .maven ? "maven" : "gradle")).\n"
-            bottomTab = .output
+    }
+
+    /// Runs one target in its own Output tab (restarting it if it is already running).
+    func run(_ target: RunTarget, jdk: JDK? = nil, prebuilt: Bool = false) {
+        guard let rootURL, let jdk = jdk ?? self.jdk else { return }
+        let configuration = runConfiguration(for: target)
+        let command = RunCommand.run(target: target, configuration: configuration, buildSystem: buildSystem, root: rootURL,
+                                     jdk: jdk, sources: Self.allJavaFiles(in: fileTree), prebuilt: prebuilt)
+        launch(command, key: "run:" + target.mainClass, title: target.displayName,
+               environment: configuration.environmentVariables)
+    }
+
+    /// Starts every Spring Boot application, each in its own tab. Multi-module projects are built once
+    /// first (Maven: install, Gradle: classes) so the apps don't race on shared modules.
+    func runAllSpringBootApps() {
+        let apps = springBootTargets
+        guard rootURL != nil, !apps.isEmpty, jdk != nil else { return }
+        saveAllNow()
+        guard modules.count > 1, let rootURL,
+              let prebuild = RunCommand.prebuildAll(buildSystem: buildSystem, root: rootURL) else {
+            for app in apps { run(app) }
             return
         }
-        start(command)
+        launch(prebuild, key: "prebuild", title: "Build All") { [weak self] status in
+            guard status == 0, let self else { return }
+            for app in apps { self.run(app, prebuilt: true) }
+        }
+    }
+
+    /// Starts a command in the session for `key` (reusing its tab). If that session is still running,
+    /// it is stopped first and the command starts once it has exited.
+    @discardableResult
+    private func launch(_ command: RunCommand?, key: String, title: String, environment extra: [String: String] = [:],
+                        onExit: @escaping (Int32) -> Void = { _ in }) -> RunSession? {
+        guard let rootURL else { return nil }
+        guard let command else {
+            showMessage("\(buildSystem.displayName) not found on PATH (brew install \(buildSystem == .maven ? "maven" : "gradle")).\n")
+            return nil
+        }
+        let session = session(key: key, title: title)
+        var environment = ToolLocator.environment(jdk: jdk)
+        environment["MAVEN_OPTS"] = (environment["MAVEN_OPTS"].map { $0 + " " } ?? "") + "-Djansi.passthrough=false"
+        environment.merge(extra) { $1 }
+        let start: @MainActor (RunSession) -> Void = { session in
+            session.onExit = onExit
+            session.start(command, directory: rootURL, environment: environment)
+        }
+        if session.isRunning {
+            session.append("\n[restarting…]\n")
+            session.onExit = { [weak session] _ in
+                guard let session else { return }
+                Task { @MainActor in start(session) }
+            }
+            session.stop()
+        } else {
+            start(session)
+        }
+        return session
+    }
+
+    /// The Output tab for `key`, created if needed, and selects it.
+    private func session(key: String, title: String) -> RunSession {
+        let session: RunSession
+        if let existing = runSessions.first(where: { $0.key == key }) {
+            session = existing
+        } else {
+            session = RunSession(key: key, title: title)
+            runSessions.append(session)
+            // Keep at most 12 tabs, dropping the oldest finished ones.
+            while runSessions.count > 12, let old = runSessions.firstIndex(where: { !$0.isRunning && $0 !== session }) {
+                runSessions.remove(at: old)
+            }
+        }
+        selectedRunID = session.id
+        bottomTab = .output
+        return session
+    }
+
+    /// Shows a message in the Output panel (in its own "Messages" tab).
+    private func showMessage(_ text: String) {
+        let session = session(key: "messages", title: "Messages")
+        session.append(text)
+    }
+
+    func closeRunSession(_ session: RunSession) {
+        if session.isRunning { session.stop() }
+        runSessions.removeAll { $0 === session }
+        if selectedRunID == session.id { selectedRunID = runSessions.last?.id }
     }
 
     /// The current file if it declares `main`, else the first project file that does.
@@ -1070,58 +1215,39 @@ final class Workspace {
         if let doc = currentDocument, Self.isJava(doc.url), !isReadOnly(doc.url), JavaProject.hasMainMethod(doc.text) {
             return (doc.url, JavaProject.qualifiedClassName(file: doc.url, source: doc.text))
         }
+        if let first = runTargets.first { return (first.file, first.mainClass) }
         guard let file = Self.firstMainFile(in: fileTree),
               let source = documents.first(where: { $0.id == Self.key(for: file) })?.text
                 ?? (try? String(contentsOf: file, encoding: .utf8)) else { return nil }
         return (file, JavaProject.qualifiedClassName(file: file, source: source))
     }
 
-    private func start(_ command: RunCommand) {
-        guard let rootURL, !isRunning else { return }
-        output = "$ \(command.display)\n"
-        bottomTab = .output
-        isRunning = true
+    // MARK: Run configurations
 
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/sh")
-        process.arguments = ["-c", command.shell]
-        process.currentDirectoryURL = rootURL
-        var environment = ToolLocator.environment(jdk: jdk)
-        environment["MAVEN_OPTS"] = (environment["MAVEN_OPTS"].map { $0 + " " } ?? "") + "-Djansi.passthrough=false"
-        process.environment = environment
-        let pipe = Pipe(), input = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-        process.standardInput = input
-        pipe.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            if data.isEmpty {
-                handle.readabilityHandler = nil
-                return
-            }
-            let chunk = String(decoding: data, as: UTF8.self)
-            Task { @MainActor in self.appendOutput(chunk) }
+    private static func runConfigurationKey(root: URL, target: RunTarget) -> String {
+        "runConfiguration:" + key(for: root) + "|" + target.mainClass
+    }
+
+    func runConfiguration(for target: RunTarget) -> RunConfiguration {
+        guard let rootURL,
+              let data = UserDefaults.standard.data(forKey: Self.runConfigurationKey(root: rootURL, target: target)),
+              let configuration = try? JSONDecoder().decode(RunConfiguration.self, from: data) else { return RunConfiguration() }
+        return configuration
+    }
+
+    func setRunConfiguration(_ configuration: RunConfiguration, for target: RunTarget) {
+        guard let rootURL else { return }
+        let key = Self.runConfigurationKey(root: rootURL, target: target)
+        if configuration.isEmpty {
+            UserDefaults.standard.removeObject(forKey: key)
+        } else if let data = try? JSONEncoder().encode(configuration) {
+            UserDefaults.standard.set(data, forKey: key)
         }
-        process.terminationHandler = { proc in
-            let status = proc.terminationStatus
-            Task { @MainActor in
-                // Let any final output chunks land first.
-                try? await Task.sleep(for: .milliseconds(50))
-                self.isRunning = false
-                self.runProcess = nil
-                try? self.runInput?.close()
-                self.runInput = nil
-                self.appendOutput("\n[process exited with status \(status)]\n")
-            }
-        }
-        do {
-            try process.run()
-            runProcess = process
-            runInput = input.fileHandleForWriting
-        } catch {
-            isRunning = false
-            appendOutput("Failed to start: \(error.localizedDescription)\n")
-        }
+    }
+
+    func editRunConfiguration() {
+        editingRunTarget = currentRunTarget
+        if editingRunTarget == nil { flashStatus("No main class to configure") }
     }
 
     /// Opens a location clicked in the Output / Debug console (`javaide://open?...`).
@@ -1176,36 +1302,24 @@ final class Workspace {
         navigate(to: url, position: position)
     }
 
-    /// Sends a line to the running program's stdin (for `Scanner` / `readLine`), echoing it in the output.
-    func sendInput(_ line: String) {
-        guard let runInput else { return }
-        appendOutput(line + "\n")
-        try? runInput.write(contentsOf: Data((line + "\n").utf8))
-    }
+    /// Sends a line to the selected program's stdin (for `Scanner` / `readLine`).
+    func sendInput(_ line: String) { selectedRun?.send(line) }
 
-    /// Closes the program's stdin (Ctrl-D).
-    func sendEOF() {
-        try? runInput?.close()
-        runInput = nil
-    }
+    /// Closes the selected program's stdin (Ctrl-D).
+    func sendEOF() { selectedRun?.sendEOF() }
 
+    /// Stops the program in the visible panel: the debuggee on the Debug tab, else the selected Output tab.
     func stopRun() {
-        if isDebugging, runProcess == nil {
+        if isDebugging, bottomTab == .debug || selectedRun?.isRunning != true {
             stopDebugging()
             return
         }
-        guard let runProcess else { return }
-        // Commands `exec` the final tool, so SIGINT reaches the JVM / Maven / Gradle directly.
-        runProcess.interrupt()
-        Task {
-            try? await Task.sleep(for: .seconds(2))
-            if runProcess.isRunning { runProcess.terminate() }
-        }
+        selectedRun?.stop()
     }
 
-    private func appendOutput(_ s: String) {
-        output += s
-        if output.utf16.count > 1_000_000 { output = String(output.suffix(800_000)) }
+    func stopAll() {
+        for session in runSessions where session.isRunning { session.stop() }
+        if isDebugging { stopDebugging() }
     }
 
     // MARK: - Debugging (java-debug inside jdtls)
@@ -1276,8 +1390,10 @@ final class Workspace {
 
     /// Debugs the current class (or the project's first main class) under java-debug.
     func startDebugging() async {
-        guard let rootURL, !isDebugging, !isRunning else { return }
+        guard let rootURL, !isDebugging else { return }
         guard let (lsp, jdk) = await prepareDebugger() else { return }
+        let target = currentRunTarget
+        let configuration = target.map(runConfiguration) ?? RunConfiguration()
         bottomTab = .debug
         do {
             // 1. Which main class, in which jdtls project.
@@ -1285,7 +1401,8 @@ final class Workspace {
                 "command": "vscode.java.resolveMainClass", "arguments": [.string(rootURL.absoluteString)],
             ]).arrayValue ?? []
             let currentKey = currentFile.map(Self.key(for:))
-            let entry = mains.first { m in m["filePath"]?.stringValue.map { Self.key(for: URL(fileURLWithPath: $0)) } == currentKey }
+            let entry = mains.first { $0["mainClass"]?.stringValue == target?.mainClass }
+                ?? mains.first { m in m["filePath"]?.stringValue.map { Self.key(for: URL(fileURLWithPath: $0)) } == currentKey }
                 ?? mains.first
             guard let entry, let mainClass = entry["mainClass"]?.stringValue else {
                 flashStatus("No main class found to debug")
@@ -1306,9 +1423,10 @@ final class Workspace {
                 "type": "java", "request": "launch", "name": .string(mainClass),
                 "mainClass": .string(mainClass), "projectName": .string(projectName),
                 "modulePaths": paths[0] ?? .array([]), "classPaths": paths[1] ?? .array([]),
-                "cwd": .string(rootURL.path), "console": "integratedTerminal",
-                "javaExec": .string(jdk.java.path), "args": "", "vmArgs": "", "stopOnEntry": false,
-                "encoding": "UTF-8",
+                "cwd": .string((target?.module.directory(root: rootURL) ?? rootURL).path), "console": "integratedTerminal",
+                "javaExec": .string(jdk.java.path), "args": .string(configuration.programArguments),
+                "vmArgs": .string(configuration.vmOptions), "stopOnEntry": false, "encoding": "UTF-8",
+                "env": .object(configuration.environmentVariables.mapValues { .string($0) }),
             ]
             startSession(port: port, launch: launch, programName: mainClass, jdk: jdk)
         } catch {

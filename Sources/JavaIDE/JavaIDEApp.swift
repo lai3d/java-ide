@@ -111,17 +111,26 @@ struct JavaIDEApp: App {
             CommandMenu("Run") {
                 Button("Run") { workspace.run(.run) }
                     .keyboardShortcut("r")
-                    .disabled(workspace.rootURL == nil || workspace.isRunning)
+                    .disabled(workspace.rootURL == nil)
                 Button("Build") { workspace.run(.build) }
                     .keyboardShortcut("b")
-                    .disabled(workspace.rootURL == nil || workspace.isRunning)
+                    .disabled(workspace.rootURL == nil || workspace.isRunning(key: "build"))
                 Button("Test") { workspace.run(.test) }
                     .keyboardShortcut("u")
-                    .disabled(workspace.rootURL == nil || workspace.isRunning)
+                    .disabled(workspace.rootURL == nil || workspace.isRunning(key: "test"))
+                Divider()
+                Button("Edit Run Configuration…") { workspace.editRunConfiguration() }
+                    .disabled(workspace.rootURL == nil)
+                Button("Run All Spring Boot Apps") { workspace.runAllSpringBootApps() }
+                    .keyboardShortcut("r", modifiers: [.shift, .command])
+                    .disabled(workspace.springBootTargets.isEmpty)
                 Divider()
                 Button("Stop") { workspace.stopRun() }
                     .keyboardShortcut(".")
-                    .disabled(!workspace.isRunning)
+                    .disabled(!workspace.isRunning && !workspace.isDebugging)
+                Button("Stop All") { workspace.stopAll() }
+                    .keyboardShortcut(".", modifiers: [.shift, .command])
+                    .disabled(!workspace.isRunning && !workspace.isDebugging)
                 Divider()
                 Button("Open JShell") {
                     workspace.bottomTab = .repl
@@ -138,7 +147,7 @@ struct JavaIDEApp: App {
             CommandMenu("Debug") {
                 Button("Debug") { Task { await workspace.startDebugging() } }
                     .keyboardShortcut("d", modifiers: [.shift, .command])
-                    .disabled(workspace.rootURL == nil || workspace.isDebugging || workspace.isRunning)
+                    .disabled(workspace.rootURL == nil || workspace.isDebugging)
                 Button("Attach to JVM…") { Task { await workspace.attachToJVM() } }
                     .disabled(workspace.rootURL == nil || workspace.isDebugging)
                 Button("Stop Debugging") { workspace.stopDebugging() }

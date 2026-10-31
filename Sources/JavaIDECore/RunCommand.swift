@@ -11,35 +11,143 @@ public struct RunCommand: Sendable, Hashable {
         self.display = display
     }
 
-    /// Runs `mainClass`. Maven uses exec:java (project dependencies on the class path); Gradle uses
-    /// `run` with the application plugin, else compiles and runs the classes; plain projects are
-    /// compiled with javac into the cache folder.
+    /// Runs `mainClass` (in the root project). See `run(target:...)`.
     public static func run(mainClass: String, file: URL, buildSystem: BuildSystem, root: URL, jdk: JDK,
                            sources: [URL]) -> RunCommand? {
+        let target = RunTarget(mainClass: mainClass, file: file,
+                               module: ProjectModule(name: root.lastPathComponent, relativePath: ""), isSpringBoot: false)
+        return run(target: target, configuration: RunConfiguration(), buildSystem: buildSystem, root: root, jdk: jdk,
+                   sources: sources)
+    }
+
+    /// Runs a target with its run configuration.
+    /// - Maven: Spring Boot apps use `spring-boot:run`, others `exec:java`. A submodule is first installed
+    ///   with its sibling dependencies (`-pl <module> -am install`) unless `prebuilt` (Run All did it).
+    /// - Gradle: `bootRun` for Spring Boot, `run` with the application plugin, else a `javaideRun` JavaExec
+    ///   task (main runtime class path) added by an init script, which also sets the main class and JVM options.
+    /// - Plain: javac into the cache folder, then java.
+    /// Spring profiles and environment variables are passed through the environment (`RunConfiguration`).
+    public static func run(target: RunTarget, configuration: RunConfiguration, buildSystem: BuildSystem, root: URL,
+                           jdk: JDK, sources: [URL], prebuilt: Bool = false) -> RunCommand? {
+        let mainClass = target.mainClass
+        let args = configuration.programArgumentList
+        let vmOptions = configuration.vmOptionList
         switch buildSystem {
         case .maven:
             guard let mvn = buildSystem.executable(root: root) else { return nil }
-            let args = ["-q", "-B", "-ntp", "compile", "exec:java", "-Dexec.mainClass=\(mainClass)",
-                        "-Dexec.cleanupDaemonThreads=false"]
-            return RunCommand(shell: "exec " + quote(mvn.path, args),
-                              display: "\(mvn.lastPathComponent) compile exec:java -Dexec.mainClass=\(mainClass)")
+            var shell = ""
+            var display = ""
+            var pomArgs: [String] = []
+            if !target.module.isRoot {
+                pomArgs = ["-f", target.module.relativePath + "/pom.xml"]
+                if !prebuilt {
+                    shell = quote(mvn.path, ["-q", "-B", "-ntp", "-pl", target.module.relativePath, "-am", "install",
+                                             "-DskipTests"]) + " && "
+                    display = "\(mvn.lastPathComponent) -pl \(target.module.relativePath) -am install && "
+                }
+            }
+            var goalArgs: [String]
+            if target.isSpringBoot {
+                goalArgs = ["org.springframework.boot:spring-boot-maven-plugin:run",
+                            "-Dspring-boot.run.main-class=\(mainClass)"]
+                if !args.isEmpty { goalArgs.append("-Dspring-boot.run.arguments=" + configuration.programArguments) }
+                if !vmOptions.isEmpty { goalArgs.append("-Dspring-boot.run.jvmArguments=" + configuration.vmOptions) }
+                display += "\(mvn.lastPathComponent) \(pomArgs.joined(separator: " ")) spring-boot:run"
+            } else {
+                goalArgs = ["compile", "exec:java", "-Dexec.mainClass=\(mainClass)", "-Dexec.cleanupDaemonThreads=false"]
+                if !args.isEmpty { goalArgs.append("-Dexec.args=" + configuration.programArguments) }
+                display += "\(mvn.lastPathComponent) \(pomArgs.joined(separator: " ")) compile exec:java -Dexec.mainClass=\(mainClass)"
+            }
+            // exec:java runs inside Maven's JVM, so its JVM options go to MAVEN_OPTS.
+            if !target.isSpringBoot, !vmOptions.isEmpty {
+                shell += "MAVEN_OPTS=\"$MAVEN_OPTS \"" + shellQuote(configuration.vmOptions) + " "
+            }
+            shell += "exec " + quote(mvn.path, ["-q", "-B", "-ntp"] + pomArgs + goalArgs)
+            return RunCommand(shell: shell, display: display.replacingOccurrences(of: "  ", with: " "))
         case .gradle:
             guard let gradle = buildSystem.executable(root: root) else { return nil }
-            if usesApplicationPlugin(root: root) {
-                return RunCommand(shell: "exec " + quote(gradle.path, ["-q", "--console=plain", "run"]),
-                                  display: "\(gradle.lastPathComponent) run")
+            let task: String
+            if target.isSpringBoot {
+                task = "bootRun"
+            } else if usesApplicationPlugin(root: target.module.directory(root: root)) {
+                task = "run"
+            } else {
+                task = "javaideRun"
             }
-            let classPath = ["build/classes/java/main", "build/resources/main"].joined(separator: ":")
-            let shell = quote(gradle.path, ["-q", "--console=plain", "classes"])
-                + " && exec " + quote(jdk.java.path, ["-cp", classPath, mainClass])
-            return RunCommand(shell: shell, display: "\(gradle.lastPathComponent) classes && java \(mainClass)")
+            guard let initScript = writeGradleInitScript(root: root, mainClass: mainClass, vmOptions: vmOptions) else { return nil }
+            let path = target.module.gradlePath == ":" ? ":" + task : target.module.gradlePath + ":" + task
+            var gradleArgs = ["-q", "--console=plain", "--init-script", initScript.path, path]
+            if !args.isEmpty { gradleArgs.append("--args=" + configuration.programArguments) }
+            return RunCommand(shell: "exec " + quote(gradle.path, gradleArgs),
+                              display: "\(gradle.lastPathComponent) \(path)" + (args.isEmpty ? "" : " --args=…"))
         case .plain:
             let out = JavaProject.plainOutputDirectory(root: root)
             guard let argFile = writeSourceList(sources: sources, root: root) else { return nil }
             let shell = compileCommand(jdk: jdk, out: out, argFile: argFile, lint: false)
-                + " && exec " + quote(jdk.java.path, ["-cp", out.path, mainClass])
+                + " && exec " + quote(jdk.java.path, vmOptions + ["-cp", out.path, mainClass] + args)
             return RunCommand(shell: shell, display: "javac -d <cache> *.java && java \(mainClass)")
         }
+    }
+
+    /// Builds every module once before Run All starts the apps side by side (so they don't race on
+    /// `target/` or the local repository): Maven installs the reactor, Gradle compiles all classes.
+    public static func prebuildAll(buildSystem: BuildSystem, root: URL) -> RunCommand? {
+        guard let tool = buildSystem.executable(root: root) else { return nil }
+        switch buildSystem {
+        case .maven:
+            return RunCommand(shell: "exec " + quote(tool.path, ["-q", "-B", "-ntp", "install", "-DskipTests"]),
+                              display: "\(tool.lastPathComponent) install -DskipTests")
+        case .gradle:
+            return RunCommand(shell: "exec " + quote(tool.path, ["-q", "--console=plain", "classes"]),
+                              display: "\(tool.lastPathComponent) classes")
+        case .plain:
+            return nil
+        }
+    }
+
+    /// Gradle init script: sets the main class and JVM options of `bootRun` / `run`, and adds `javaideRun`
+    /// for projects without either.
+    static func writeGradleInitScript(root: URL, mainClass: String, vmOptions: [String]) -> URL? {
+        func groovy(_ s: String) -> String {
+            "'" + s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "\\'") + "'"
+        }
+        let jvmArgs = "[" + vmOptions.map(groovy).joined(separator: ", ") + "]"
+        let script = """
+            // Generated by JavaIDE for Run.
+            allprojects { p ->
+                p.tasks.withType(JavaExec).configureEach { t ->
+                    if (t.name == 'bootRun' || t.name == 'run' || t.name == 'javaideRun') {
+                        t.mainClass.set(\(groovy(mainClass)))
+                        t.jvmArgs(\(jvmArgs))
+                    }
+                }
+                p.plugins.withId('java') {
+                    if (p.tasks.findByName('javaideRun') == null) {
+                        p.tasks.register('javaideRun', JavaExec) { t ->
+                            t.group = 'application'
+                            t.classpath = p.sourceSets.main.runtimeClasspath
+                            t.standardInput = System.in
+                        }
+                    }
+                }
+            }
+
+            """
+        let folder = JavaProject.cacheDirectory(for: root)
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let file = folder.appendingPathComponent("javaide-run-\(fnv(mainClass)).gradle")
+        do {
+            try script.write(to: file, atomically: true, encoding: .utf8)
+            return file
+        } catch {
+            return nil
+        }
+    }
+
+    private static func fnv(_ s: String) -> String {
+        var hash: UInt32 = 2166136261
+        for byte in s.utf8 { hash = (hash ^ UInt32(byte)) &* 16777619 }
+        return String(hash, radix: 16)
     }
 
     /// Runs the test suite, or one test class.

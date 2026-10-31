@@ -28,7 +28,10 @@ struct CodeEditorView: NSViewRepresentable {
     /// All open documents, so state for closed ones can be dropped.
     var openDocumentIDs: Set<String>
     var text: String
+    /// Java editing features (completion, indent rules, quick fixes).
     var highlightCode: Bool
+    /// Syntax colouring (Java, or `.properties` / `.yml` config files).
+    var language: SyntaxLanguage = .none
     var isEditable: Bool
     var diagnostics: [Diagnostic]
     var breakpointLines: Set<Int> = []
@@ -133,6 +136,7 @@ struct CodeEditorView: NSViewRepresentable {
             // Replaced from outside (e.g. reloaded); typing never gets here since text already matches.
             coordinator.replaceText(text)
         } else if coordinator.appliedDiagnostics != diagnostics || coordinator.appliedHighlightCode != highlightCode
+                    || coordinator.appliedLanguage != language
                     || coordinator.appliedExecutionLine != executionLine {
             coordinator.applyStyling()
         }
@@ -176,6 +180,7 @@ struct CodeEditorView: NSViewRepresentable {
         weak var textView: CodeTextView?
         var appliedDiagnostics: [Diagnostic] = []
         var appliedHighlightCode = false
+        var appliedLanguage: SyntaxLanguage = .none
         var appliedExecutionLine: Int?
         var lastRevealID: UUID?
         var lastQuickFixRequest: UUID?
@@ -764,8 +769,8 @@ struct CodeEditorView: NSViewRepresentable {
 
             storage.beginEditing()
             storage.setAttributes(EditorTheme.baseAttributes, range: fullRange)
-            if parent.highlightCode {
-                for token in JavaHighlighter.tokenize(text) {
+            if parent.language != .none {
+                for token in parent.language.tokenize(text) {
                     storage.addAttribute(.foregroundColor, value: EditorTheme.color(for: token.kind), range: token.range)
                 }
             }
@@ -793,6 +798,7 @@ struct CodeEditorView: NSViewRepresentable {
             ruler?.setDiagnostics(parent.diagnostics)
             appliedDiagnostics = parent.diagnostics
             appliedHighlightCode = parent.highlightCode
+            appliedLanguage = parent.language
         }
     }
 }

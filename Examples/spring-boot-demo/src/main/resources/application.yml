@@ -1,0 +1,17 @@
+# Default profile
+server:
+  port: 18070
+demo:
+  greeting: Hello   # overridden by the dev profile
+spring:
+  application:
+    name: spring-boot-demo
+---
+spring:
+  config:
+    activate:
+      on-profile: dev
+server:
+  port: 18071
+demo:
+  greeting: "Hi from dev"

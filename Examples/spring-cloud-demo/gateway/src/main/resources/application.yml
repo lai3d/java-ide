@@ -1,0 +1,7 @@
+spring:
+  application:
+    name: gateway
+server:
+  port: 18080
+demo:
+  greeting-service-uri: http://localhost:18081
