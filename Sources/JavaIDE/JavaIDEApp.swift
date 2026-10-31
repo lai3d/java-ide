@@ -7,9 +7,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Writing to a dead language server's stdin must not kill the app.
         signal(SIGPIPE, SIG_IGN)
-        // Needed when launched as a bare SwiftPM executable (no .app bundle).
-        NSApp.setActivationPolicy(.regular)
-        NSApp.activate(ignoringOtherApps: true)
+        // Only for a bare SwiftPM executable (`swift run`, no .app bundle). In a bundled app built
+        // against the macOS 26 SDK, these calls stop SwiftUI from opening the first window at all.
+        if Bundle.main.bundleIdentifier == nil {
+            NSApp.setActivationPolicy(.regular)
+            NSApp.activate(ignoringOtherApps: true)
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -27,11 +30,6 @@ struct JavaIDEApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var workspace = Workspace()
 
-    init() {
-        // Don't restore window state: a saved "no windows open" state (e.g. after the app was killed)
-        // would otherwise relaunch it with no window at all. The workspace reopens its own folder.
-        UserDefaults.standard.register(defaults: ["ApplePersistenceIgnoreState": true])
-    }
 
     var body: some Scene {
         WindowGroup("JavaIDE") {
